@@ -1,17 +1,17 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>tenfold</Name>
-  <!-- Replace YOUR_GITHUB_USERNAME with your GitHub username in lowercase -->
-  <Repository>ghcr.io/YOUR_GITHUB_USERNAME/tenfold:latest</Repository>
-  <Registry>https://github.com/YOUR_GITHUB_USERNAME/tenfold/pkgs/container/tenfold</Registry>
+  <!-- Replace trev9575 with your GitHub username in lowercase -->
+  <Repository>ghcr.io/trev9575/tenfold:latest</Repository>
+  <Registry>https://github.com/trev9575/tenfold/pkgs/container/tenfold</Registry>
   <Network>bridge</Network>
   <Privileged>false</Privileged>
-  <Support>https://github.com/YOUR_GITHUB_USERNAME/tenfold</Support>
-  <Project>https://github.com/YOUR_GITHUB_USERNAME/tenfold</Project>
+  <Support>https://github.com/trev9575/tenfold</Support>
+  <Project>https://github.com/trev9575/tenfold</Project>
   <Overview>Tenfold: a small self-hosted EOS-style team tool. Accountability chart, Level 10 meetings, scorecard, rocks, to-dos, issues, headlines and V/TO.</Overview>
   <Category>Productivity: Tools:</Category>
   <WebUI>http://[IP]:[PORT:8090]/</WebUI>
-  <Icon>https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/tenfold/main/static/favicon.svg</Icon>
+  <Icon>https://raw.githubusercontent.com/trev9575/tenfold/main/static/favicon.svg</Icon>
   <Config Name="Web UI Port" Target="8090" Default="8090" Mode="tcp" Description="Port for the web interface" Type="Port" Display="always" Required="true" Mask="false">8090</Config>
   <Config Name="Data" Target="/data" Default="/mnt/user/appdata/tenfold" Mode="rw" Description="Where the database is stored" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/tenfold</Config>
   <Config Name="TZ" Target="TZ" Default="America/New_York" Mode="" Description="Time zone" Type="Variable" Display="always" Required="false" Mask="false">America/New_York</Config>

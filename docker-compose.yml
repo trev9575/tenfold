@@ -1,7 +1,7 @@
 services:
   tenfold:
-    # Use the image GitHub builds for you (replace YOUR_GITHUB_USERNAME, all lowercase)…
-    image: ghcr.io/YOUR_GITHUB_USERNAME/tenfold:latest
+    # Use the image GitHub builds for you (replace trev9575, all lowercase)…
+    image: ghcr.io/trev9575/tenfold:latest
     # …or comment out the line above and uncomment this to build from the source folder:
     # build: .
     container_name: tenfold

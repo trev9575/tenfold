@@ -42,7 +42,7 @@ When you push this repo to GitHub, the included GitHub Actions workflow (`.githu
 
 The folder is already a git repo with one commit. From inside the `tenfold` folder:
 ```bash
-git remote add origin https://github.com/YOUR_GITHUB_USERNAME/tenfold.git
+git remote add origin https://github.com/trev9575/tenfold.git
 git branch -M main
 git push -u origin main
 ```
@@ -65,10 +65,10 @@ GitHub makes new container images **private** by default, and Unraid can't pull 
 1. Go to your GitHub profile and open the **Packages** tab, then click **tenfold**.
 2. Open **Package settings** (bottom right), scroll to *Danger Zone*, choose **Change visibility → Public**, and confirm.
 
-Only the built app becomes public. Your friends' data stays on your server. If you'd rather keep the image private, run `docker login ghcr.io -u YOUR_GITHUB_USERNAME` in the Unraid terminal, using a GitHub personal access token with `read:packages` as the password.
+Only the built app becomes public. Your friends' data stays on your server. If you'd rather keep the image private, run `docker login ghcr.io -u trev9575` in the Unraid terminal, using a GitHub personal access token with `read:packages` as the password.
 
 ### 5. Set your username in the Unraid files
-Replace `YOUR_GITHUB_USERNAME` with your GitHub username, **in lowercase**, in `unraid/tenfold.xml` and `docker-compose.yml`. Then commit and push.
+Replace `trev9575` with your GitHub username, **in lowercase**, in `unraid/tenfold.xml` and `docker-compose.yml`. Then commit and push.
 
 ---
 
@@ -79,7 +79,7 @@ Replace `YOUR_GITHUB_USERNAME` with your GitHub username, **in lowercase**, in `
 1. **Copy the template to the flash drive.** In the Unraid web UI, click the **>_ Terminal** icon (top right) and run:
    ```bash
    wget -O /boot/config/plugins/dockerMan/templates-user/my-tenfold.xml \
-     https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/tenfold/main/unraid/tenfold.xml
+     https://raw.githubusercontent.com/trev9575/tenfold/main/unraid/tenfold.xml
    ```
    This needs a public repo. For a private repo, copy the file to the same path with a file manager or SMB share instead (`\\TOWER\flash\config\plugins\dockerMan\templates-user\my-tenfold.xml`).
 2. Go to the **Docker** tab and click **Add Container** (at the bottom).
