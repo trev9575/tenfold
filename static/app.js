@@ -111,8 +111,21 @@ function formModal({ title, fields, submitLabel = "Save", onSubmit, onDelete, ex
     if (f.type === "textarea") el = h("textarea", { name: f.name, rows: f.rows || 4 });
     else if (f.type === "select") el = h("select", { name: f.name }, f.options.map(([v, l]) => h("option", { value: v }, l)));
     else if (f.type === "checkbox") el = h("input", { type: "checkbox", name: f.name, class: "check" });
+    else if (f.type === "multiselect") {
+      const sel = new Set((f.value || []).map(String));
+      const boxes = f.options.map(([v, l]) => {
+        const cb = h("input", { type: "checkbox", value: v, checked: sel.has(String(v)) });
+        return h("label", { class: "chip" }, cb, f.avatars ? avatar(Number(v)) : null, h("span", {}, l));
+      });
+      const all = h("button", { type: "button", class: "btn small", onclick: () => {
+        const cbs = el.querySelectorAll("input"); const every = [...cbs].every((c) => c.checked);
+        cbs.forEach((c) => (c.checked = !every));
+      } }, "Everyone");
+      el = h("div", { class: "chips" }, boxes, all);
+    }
     else el = h("input", { type: f.type || "text", name: f.name, step: f.step, placeholder: f.placeholder || "" });
     if (f.type === "checkbox") el.checked = !!f.value;
+    else if (f.type === "multiselect") { /* set above */ }
     else el.value = f.value == null ? "" : f.value;
     inputs[f.name] = el;
     return h("div", { class: "field" }, h("label", {}, f.label), el, f.hint && h("div", { class: "hint" }, f.hint));
@@ -130,13 +143,14 @@ function formModal({ title, fields, submitLabel = "Save", onSubmit, onDelete, ex
     const v = {};
     for (const f of fields) {
       const el = inputs[f.name];
+      if (f.type === "multiselect") { const ids = [...el.querySelectorAll("input:checked")].map((c) => c.value); v[f.name] = ids.length ? ids : null; continue; }
       v[f.name] = f.type === "checkbox" ? (el.checked ? 1 : 0) : el.value.trim() === "" ? null : el.value.trim();
     }
     return v;
   };
   async function submit() {
     const v = values();
-    for (const f of fields) if (f.required && !v[f.name]) { toast(`${f.label} is required`, true); inputs[f.name].focus(); return; }
+    for (const f of fields) if (f.required && !v[f.name]) { toast(f.type === "multiselect" ? `Pick at least one of the ${f.label.toLowerCase()}` : `${f.label} is required`, true); (inputs[f.name].querySelector("input") || inputs[f.name]).focus(); return; }
     await safe(async () => { await onSubmit(v); close(); });
   }
   close = openModal(title, body, (c) => [
@@ -317,17 +331,27 @@ async function todosPanel(el, opts = {}) {
     list, S.teamId ? h("div", { class: "quick-add" }, qa) : null));
 }
 
+const ownersField = (ids) => ({ name: "owner_ids", label: "Owners", type: "multiselect", avatars: true, required: true,
+  options: S.users.map((u) => [u.id, u.name]), value: ids.filter(Boolean),
+  hint: "Pick more than one and everyone gets their own copy to check off." });
+
+async function createTodosForOwners(v, extra = {}) {
+  const { owner_ids, ...rest } = v;
+  for (const oid of owner_ids) await api("POST", "todos", { ...rest, ...extra, owner_id: Number(oid) });
+  if (owner_ids.length > 1) toast(`Created ${owner_ids.length} to-dos`);
+}
+
 function editTodo(t, done) {
   formModal({
     title: t.id ? "Edit to-do" : "New to-do",
     fields: [
       { name: "title", label: "Title", value: t.title, required: true },
       { name: "description", label: "Details", type: "textarea", value: t.description, rows: 3 },
-      { name: "owner_id", label: "Owner", type: "select", options: userOptions(), value: t.owner_id, half: true },
-      { name: "due_date", label: "Due", type: "date", value: t.due_date, half: true },
+      t.id ? { name: "owner_id", label: "Owner", type: "select", options: userOptions(), value: t.owner_id, half: true } : ownersField([t.owner_id]),
+      { name: "due_date", label: "Due", type: "date", value: t.due_date, half: !!t.id },
       { name: "team_id", label: "Team", type: "select", options: S.teams.map((x) => [x.id, x.name]), value: t.team_id },
     ],
-    onSubmit: async (v) => { await api(t.id ? "PUT" : "POST", "todos" + (t.id ? "/" + t.id : ""), v); done(); },
+    onSubmit: async (v) => { if (t.id) await api("PUT", "todos/" + t.id, v); else await createTodosForOwners(v); done(); },
     onDelete: t.id ? async () => { await api("DELETE", "todos/" + t.id); done(); } : null,
   });
 }
@@ -395,11 +419,11 @@ function issueToTodo(i, done) {
     title: "To-do from issue",
     fields: [
       { name: "title", label: "To-do", value: "", required: true, placeholder: "What needs to happen?" },
-      { name: "owner_id", label: "Owner", type: "select", options: userOptions(), value: i.owner_id || S.me.id, half: true },
-      { name: "due_date", label: "Due", type: "date", value: addDays(today(), 7), half: true },
+      ownersField([i.owner_id || S.me.id]),
+      { name: "due_date", label: "Due", type: "date", value: addDays(today(), 7) },
     ],
     submitLabel: "Create to-do",
-    onSubmit: async (v) => { await api("POST", "todos", { ...v, team_id: i.team_id, issue_id: i.id, description: "From issue: " + i.title }); toast("To-do created"); done(); },
+    onSubmit: async (v) => { await createTodosForOwners(v, { team_id: i.team_id, issue_id: i.id, description: "From issue: " + i.title }); if (v.owner_ids.length === 1) toast("To-do created"); done(); },
   });
 }
 

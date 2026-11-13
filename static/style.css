@@ -244,3 +244,9 @@ table.sc td.cur { background: color-mix(in srgb, var(--accent-soft) 45%, transpa
 .mt { margin-top: 16px; }
 table.sc td.name, table.sc th.name { position: sticky; left: 0; z-index: 1; background: var(--panel); box-shadow: 1px 0 0 var(--line); }
 table.sc th.name { z-index: 2; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px 4px 6px; cursor: pointer; font-size: 14px; background: var(--panel); user-select: none; }
+.chip input { position: absolute; opacity: 0; pointer-events: none; }
+.chip .av { width: 22px; height: 22px; font-size: 10px; }
+.chip:has(input:checked) { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.chip:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 1px; }
