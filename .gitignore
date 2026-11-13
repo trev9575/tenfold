@@ -1,0 +1,10 @@
+# Local database / runtime data (never commit this)
+data/
+*.db
+*.db-wal
+*.db-shm
+
+__pycache__/
+*.pyc
+.DS_Store
+.env

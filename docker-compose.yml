@@ -1,0 +1,16 @@
+services:
+  tenfold:
+    # Use the image GitHub builds for you (replace YOUR_GITHUB_USERNAME, all lowercase)…
+    image: ghcr.io/YOUR_GITHUB_USERNAME/tenfold:latest
+    # …or comment out the line above and uncomment this to build from the source folder:
+    # build: .
+    container_name: tenfold
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      - TZ=America/New_York
+      # Set to true only if you serve Tenfold over HTTPS (e.g. behind a reverse proxy)
+      - COOKIE_SECURE=false
+    volumes:
+      - /mnt/user/appdata/tenfold:/data
