@@ -1193,7 +1193,8 @@ class Handler(BaseHTTPRequestHandler):
                 "sort, milestone, rock_id, ext_key, priority, project, phase, workstream, created_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (team_id, r["title"][:500], r["notes"] or None, owners[0] if owners else None, encode_ids(owners), due,
-                 1 if is_done else 0, None, board_id, col_id,  # already-done imports don't count toward to-do stats sort_in[col_id], 1 if r["milestone"] else 0,
+                 # done_at stays empty so tasks that were already done don't count toward this week's to-do stats
+                 1 if is_done else 0, None, board_id, col_id, sort_in[col_id], 1 if r["milestone"] else 0,
                  rock_id, r["key"] or None, r["priority"] or None, r["project"] or None, r["phase"] or None,
                  r["workstream"] or None, now))
             made += 1
