@@ -1713,7 +1713,7 @@ const fmtTime = (d) => d.toLocaleTimeString(undefined, { hour: "numeric", minute
 async function pageSettings(view) {
   view.append(pageHead("Settings", "Your profile" + (S.me.is_admin ? ", teams and people" : "")));
   const profile = h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "My profile")),
-    h("div", { class: "card-body" }, h("p", { class: "muted", style: { marginTop: 0 } }, `${S.me.name} · ${S.me.email}`),
+    h("div", { class: "card-body" }, h("p", { class: "muted", style: { marginTop: 0 } }, `${S.me.name} · ${S.me.email}`, h("br"), `Tenfold version ${live.version || "?"}`),
       h("button", { class: "btn", onclick: () => formModal({
         title: "Edit profile",
         fields: [

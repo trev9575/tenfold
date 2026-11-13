@@ -39,7 +39,7 @@ PORT = int(os.environ.get("PORT", "8090"))
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
 SESSION_DAYS = int(os.environ.get("SESSION_DAYS", "30"))
 COOKIE_NAME = "tf_session"
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -694,10 +694,16 @@ class Handler(BaseHTTPRequestHandler):
             ctype += "; charset=utf-8"
         with open(full, "rb") as f:
             data = f.read()
+        is_page = full.endswith("index.html")
+        if is_page:
+            # Point the page at versioned file names so phones and home-screen shortcuts
+            # can never keep running an old copy of the app after an update.
+            data = (data.decode().replace('"/app.js"', f'"/app.js?v={VERSION}"')
+                    .replace('"/style.css"', f'"/style.css?v={VERSION}"').encode())
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control", "no-store" if is_page else "no-cache")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "SAMEORIGIN")
         self.end_headers()
