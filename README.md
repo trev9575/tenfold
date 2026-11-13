@@ -17,7 +17,7 @@ A small, self-hosted team tool for running your business on EOS®-style practice
 | **Headlines** | Customer and employee news, drop down to issues |
 | **Vision / Traction Organizer** | Core values, core focus, 10-year target, marketing strategy, 3-year picture, 1-year plan; pulls in current rocks and long-term issues. Autosaves |
 | **Accountability Chart** | Org chart of seats, the person in each seat, and their roles |
-| **Teams and people** | Multiple teams, admin-managed accounts, password changes |
+| **Teams and people** | Multiple teams, invite-link sign-up, admin-managed accounts, password changes |
 
 | Meeting runner | Accountability chart | Scorecard |
 |---|---|---|
@@ -68,7 +68,7 @@ GitHub makes new container images **private** by default, and Unraid can't pull 
 Only the built app becomes public. Your friends' data stays on your server. If you'd rather keep the image private, run `docker login ghcr.io -u trev9575` in the Unraid terminal, using a GitHub personal access token with `read:packages` as the password.
 
 ### 5. Set your username in the Unraid files
-Replace `trev9575` with your GitHub username, **in lowercase**, in `unraid/tenfold.xml` and `docker-compose.yml`. Then commit and push.
+Replace `YOUR_GITHUB_USERNAME` (already set to `trev9575` in this repo) with your GitHub username, **in lowercase**, in `unraid/tenfold.xml` and `docker-compose.yml`. Then commit and push.
 
 ---
 
@@ -133,7 +133,9 @@ docker run -d --name tenfold --restart unless-stopped \
 ## Part 3: First run
 
 1. Open the WebUI. The first visit shows **Set up Tenfold**, where you create the admin account and the first team.
-2. Go to **Settings → People → + Person** to create an account for each friend. Send them the email and temporary password; they can change it under **Settings → Edit profile**.
+2. Get your friends in, one of two ways:
+   - **Invite link (easiest):** under **Settings → Invite friends**, click **Create invite link** and send the link to your friends. They open it and create their own accounts. Anyone who has the link can sign up, so click **Turn off sign-ups** once everyone has joined, or click **New link** to stop the old link from working. The link uses whatever address you opened Tenfold with, so open Tenfold at the address your friends will use (your Tailscale name or domain) before you copy it.
+   - **Create accounts yourself:** under **Settings → People → + Person**, make each account and send your friend the email and temporary password. They can change the password under **Settings → Edit profile**.
 3. Add more teams under **Settings → Teams** if you need them. Switch teams with the dropdown at the top left.
 4. A suggested order for setting things up: **Accountability Chart → V/TO → Rocks → Scorecard**, then run your first **Level 10 Meeting**.
 
@@ -176,7 +178,7 @@ python3 server.py
 ## Troubleshooting
 
 - **"pull access denied" or "unauthorized" when installing:** the GHCR package is still private (see Part 1, step 4), or the username in the repository field isn't all lowercase.
-- **The page won't load:** check the container log (Docker tab → Tenfold icon → *Logs*). It should say `Tenfold 1.0.0 running on http://0.0.0.0:8090`. Make sure the host port isn't used by another container.
+- **The page won't load:** check the container log (Docker tab → Tenfold icon → *Logs*). It should say `Tenfold 1.1.0 running on http://0.0.0.0:8090`. Make sure the host port isn't used by another container.
 - **You keep getting signed out over plain HTTP:** make sure `COOKIE_SECURE` is `false` unless you're using HTTPS.
 - **Forgot the admin password:** another admin can reset it under Settings → People. If you were the only admin, stop the container, delete `tenfold.db`, and start over (this erases everything), or ask for help resetting it with `sqlite3`.
 

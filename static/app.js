@@ -222,7 +222,10 @@ async function boot() {
   } catch (e) { S.me = null; }
   if (!S.me) {
     const st = await fetch("/api/status").then((r) => r.json());
-    return st.needs_setup ? renderSetup(app) : renderLogin(app);
+    if (st.needs_setup) return renderSetup(app);
+    const join = location.hash.match(/^#\/join\/([^/?]+)/);
+    if (join) return renderRegister(app, decodeURIComponent(join[1]));
+    return renderLogin(app, st.signup_open);
   }
   await loadBasics();
   renderShell();
@@ -235,7 +238,7 @@ async function loadBasics() {
   S.teamId = S.teams.find((t) => t.id === saved) ? saved : (S.teams[0] || {}).id || null;
 }
 
-function authCard(title, sub, fields, btnLabel, onSubmit) {
+function authCard(title, sub, fields, btnLabel, onSubmit, footer) {
   const err = h("div", { class: "err" });
   const inputs = fields.map(([name, label, type]) => h("input", { name, type, id: "f_" + name, required: true, autocomplete: type === "password" ? (name === "password" && btnLabel === "Sign in" ? "current-password" : "new-password") : name }));
   const form = h("form", {
@@ -249,13 +252,24 @@ function authCard(title, sub, fields, btnLabel, onSubmit) {
   h("button", { class: "btn primary", type: "submit", style: { width: "100%", justifyContent: "center" } }, btnLabel));
   return h("div", { class: "auth" }, h("div", { class: "card" },
     h("div", { class: "brand", style: { color: "var(--ink)", padding: "0 0 14px" } }, h("div", { class: "brand-mark", style: { color: "#fff" } }, "10"), "Tenfold"),
-    h("h1", {}, title), h("p", {}, sub), form));
+    h("h1", {}, title), h("p", {}, sub), form,
+    footer ? h("p", { style: { margin: "18px 0 0", textAlign: "center" } }, footer) : null));
 }
 
-function renderLogin(app) {
+function renderLogin(app, signupOpen) {
   app.innerHTML = "";
   app.append(authCard("Sign in", "Welcome back.", [["email", "Email", "email"], ["password", "Password", "password"]], "Sign in",
-    (v) => api("POST", "login", v)));
+    (v) => api("POST", "login", v),
+    signupOpen ? ["New here? ", h("a", { href: "#", onclick: (e) => { e.preventDefault(); renderRegister(app, ""); } }, "Create an account")] : "New here? Ask your admin for an invite link."));
+}
+
+function renderRegister(app, code) {
+  app.innerHTML = "";
+  app.append(authCard("Create your account", "You'll need the invite code from your admin. An invite link fills it in for you.",
+    [["name", "Your name", "text"], ["email", "Email", "email"], ["password", "Password (8+ characters)", "password"], ["code", "Invite code", "text"]],
+    "Create account", async (v) => { await api("POST", "register", v); location.hash = "#/home"; },
+    ["Already have an account? ", h("a", { href: "#", onclick: (e) => { e.preventDefault(); location.hash = ""; boot(); } }, "Sign in")]));
+  $("#f_code").value = code || "";
 }
 
 function renderSetup(app) {
@@ -936,6 +950,30 @@ async function pageSettings(view) {
   if (!S.me.is_admin) return;
 
   const reload = async () => { await loadBasics(); renderShell(); route(); };
+
+  // Invite link
+  const inviteBody = h("div", { class: "card-body" });
+  const renderInvite = (code) => {
+    inviteBody.innerHTML = "";
+    if (!code) {
+      inviteBody.append(h("p", { class: "muted", style: { marginTop: 0 } }, "Sign-ups are closed. Turn on an invite link so friends can create their own accounts."),
+        h("button", { class: "btn primary", onclick: () => safe(async () => renderInvite((await api("POST", "invite", { action: "new" })).code)) }, "Create invite link"));
+      return;
+    }
+    const link = `${location.origin}/#/join/${encodeURIComponent(code)}`;
+    const inp = h("input", { class: "input", readonly: true, value: link, onfocus: (e) => e.target.select() });
+    inviteBody.append(
+      h("p", { class: "muted", style: { marginTop: 0 } }, "Anyone with this link can create an account. Send it to your friends; they can also type the code on the sign-in page."),
+      h("div", { style: { display: "flex", gap: "8px", marginBottom: "10px" } }, inp,
+        h("button", { class: "btn primary", onclick: async () => {
+          try { await navigator.clipboard.writeText(link); toast("Invite link copied"); } catch (e) { inp.focus(); inp.select(); toast("Press Ctrl+C / ⌘C to copy"); }
+        } }, "Copy")),
+      h("div", { class: "toolbar" }, h("span", { class: "meta" }, "Code: ", h("b", {}, code)), h("span", { style: { flex: 1 } }),
+        h("button", { class: "btn small", onclick: () => { if (confirm("Make a new link? The old one will stop working.")) safe(async () => renderInvite((await api("POST", "invite", { action: "new" })).code)); } }, "New link"),
+        h("button", { class: "btn small danger", onclick: () => safe(async () => renderInvite((await api("POST", "invite", { action: "disable" })).code)) }, "Turn off sign-ups")));
+  };
+  view.append(h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Invite friends")), inviteBody));
+  renderInvite((await api("GET", "invite")).code);
   view.append(h("div", { class: "card" },
     h("div", { class: "card-head" }, h("h2", {}, "Teams"), h("span", { class: "spacer" }),
       h("button", { class: "btn small", onclick: () => formModal({ title: "New team", fields: [{ name: "name", label: "Team name", required: true }], onSubmit: async (v) => { const t = await api("POST", "teams", v); S.teamId = t.id; store.set("tf_team", t.id); await reload(); } }) }, "+ Team")),

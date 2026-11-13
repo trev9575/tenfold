@@ -29,7 +29,7 @@ PORT = int(os.environ.get("PORT", "8090"))
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
 SESSION_DAYS = int(os.environ.get("SESSION_DAYS", "30"))
 COOKIE_NAME = "tf_session"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -132,6 +132,10 @@ CREATE TABLE IF NOT EXISTS meetings (
   data TEXT,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
 CREATE TABLE IF NOT EXISTS vto (
   team_id INTEGER PRIMARY KEY REFERENCES teams(id) ON DELETE CASCADE,
   data TEXT NOT NULL,
@@ -209,6 +213,19 @@ def check_password(pw, stored):
         return hmac.compare_digest(test.hex(), dk)
     except Exception:
         return False
+
+
+def get_setting(conn, key):
+    r = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return r["value"] if r else None
+
+
+def set_setting(conn, key, value):
+    if value is None:
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+    else:
+        conn.execute("INSERT INTO settings(key, value) VALUES (?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
 
 def row(r):
@@ -386,7 +403,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if head == "status" and method == "GET":
             n = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-            return {"needs_setup": n == 0, "version": VERSION}
+            return {"needs_setup": n == 0, "signup_open": bool(get_setting(conn, "invite_code")), "version": VERSION}
 
         if head == "setup" and method == "POST":
             if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0:
@@ -397,6 +414,21 @@ class Handler(BaseHTTPRequestHandler):
                 (name, email, hash_password(pw), now_iso()))
             team = (body.get("team") or "Leadership Team").strip()
             conn.execute("INSERT INTO teams(name, created_at) VALUES (?,?)", (team, now_iso()))
+            self.start_session(conn, cur.lastrowid)
+            return {"ok": True}
+
+        if head == "register" and method == "POST":
+            code = get_setting(conn, "invite_code")
+            given = str(body.get("code", "")).strip()
+            if not code or not hmac.compare_digest(given, code):
+                time.sleep(0.8)
+                raise ApiError(403, "That invite code isn't valid. Ask your admin for a new invite link.")
+            name, email, pw = self.user_fields(body, need_pw=True)
+            if conn.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone():
+                raise ApiError(400, "An account with that email already exists. Try signing in.")
+            cur = conn.execute(
+                "INSERT INTO users(name,email,pw_hash,is_admin,created_at) VALUES (?,?,?,0,?)",
+                (name, email, hash_password(pw), now_iso()))
             self.start_session(conn, cur.lastrowid)
             return {"ok": True}
 
@@ -425,6 +457,18 @@ class Handler(BaseHTTPRequestHandler):
                 return public_user(user)
             if method == "PUT":
                 return self.update_self(conn, body)
+
+        if head == "invite":
+            self.require_admin()
+            if method == "POST":
+                action = body.get("action")
+                if action == "new":
+                    set_setting(conn, "invite_code", secrets.token_urlsafe(9))
+                elif action == "disable":
+                    set_setting(conn, "invite_code", None)
+                else:
+                    raise ApiError(400, "action must be 'new' or 'disable'")
+            return {"code": get_setting(conn, "invite_code")}
 
         if head == "users":
             return self.users_api(conn, method, parts, body)
