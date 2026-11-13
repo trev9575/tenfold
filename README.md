@@ -16,7 +16,7 @@ A small, self-hosted team tool for running your business on EOS®-style practice
 | **Issues** | Short- and long-term lists, top-3 ranking, solve, turn into to-dos |
 | **Headlines** | Customer and employee news, drop down to issues |
 | **Vision / Traction Organizer** | Core values, core focus, 10-year target, marketing strategy, 3-year picture, 1-year plan; pulls in current rocks and long-term issues. Autosaves |
-| **Accountability Chart** | Org chart of seats, the people in each seat, and their roles |
+| **Accountability Chart** | A separate org chart per team, showing the seats, the people in each seat, and their roles |
 | **Availability** | Weekly team calendar from everyone's Google Calendar, showing busy blocks per person and highlighting times when everyone is free. Teammates see only busy/free, never event titles |
 | **Live updates** | Changes from friends appear on everyone's screen within about a second, with a note saying who changed what. The sidebar shows who's online, and meetings stay in sync across everyone's screens. Refreshes wait while you're typing |
 | **Teams and people** | Multiple teams, invite-link sign-up, admin-managed accounts, password changes |

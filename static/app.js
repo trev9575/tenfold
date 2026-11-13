@@ -794,10 +794,11 @@ async function pageScorecard(view) {
 
 // ---- accountability chart
 async function pageChart(view) {
-  const seats = await api("GET", "seats");
+  if (needTeam(view)) return;
+  const seats = await api("GET", "seats?team_id=" + S.teamId);
   const reload = () => route();
-  view.append(pageHead("Accountability Chart", "Seats, the people in them, and the 3–5 roles each owns",
-    h("button", { class: "btn primary", onclick: () => editSeat({ parent_id: null }, seats, reload) }, "+ Seat")));
+  view.append(pageHead("Accountability Chart", teamName(S.teamId) + " · seats, the people in them, and the 3–5 roles each owns",
+    h("button", { class: "btn primary", onclick: () => editSeat({ team_id: S.teamId, parent_id: null }, seats, reload) }, "+ Seat")));
   const kids = (pid) => seats.filter((s) => (s.parent_id || null) === pid).sort((a, b) => a.sort - b.sort || a.id - b.id);
   const node = (s) => {
     const roles = (s.roles || "").split("\n").map((x) => x.trim()).filter(Boolean);
@@ -805,7 +806,7 @@ async function pageChart(view) {
     return h("li", {},
       h("div", { class: "seat" },
         h("div", { class: "seat-top" }, h("span", {}, s.title),
-          h("button", { title: "Add a seat under this one", onclick: () => editSeat({ parent_id: s.id }, seats, reload) }, "+"),
+          h("button", { title: "Add a seat under this one", onclick: () => editSeat({ team_id: s.team_id || S.teamId, parent_id: s.id }, seats, reload) }, "+"),
           h("button", { title: "Edit seat", onclick: () => editSeat(s, seats, reload) }, "✎")),
         ownersOf(s, "user_id", "user_ids").length
           ? ownersOf(s, "user_id", "user_ids").map((id) => h("div", { class: "seat-person" }, avatar(id), userName(id)))
@@ -815,8 +816,8 @@ async function pageChart(view) {
   };
   const roots = kids(null);
   if (!roots.length) {
-    view.append(h("div", { class: "card empty" }, h("p", {}, "Start with the top seat (often Visionary or Integrator), then add the seats that report to it."),
-      h("button", { class: "btn primary", onclick: () => editSeat({ parent_id: null, title: "Visionary" }, seats, reload) }, "Add the first seat")));
+    view.append(h("div", { class: "card empty" }, h("p", {}, `${teamName(S.teamId)} doesn't have an accountability chart yet. Start with the top seat (often Visionary or Integrator), then add the seats that report to it.`),
+      h("button", { class: "btn primary", onclick: () => editSeat({ team_id: S.teamId, parent_id: null, title: "Visionary" }, seats, reload) }, "Add the first seat")));
     return;
   }
   view.append(h("div", { class: "card" }, h("div", { class: "chart-scroll" }, h("ul", { class: "tree" }, roots.map(node)))));
@@ -835,7 +836,7 @@ function editSeat(s, seats, done) {
       { name: "parent_id", label: "Reports to", type: "select", options: [["", "— Top of chart —"], ...seats.filter((x) => !descendants.has(x.id)).map((x) => [x.id, x.title])], value: s.parent_id, half: true },
       { name: "sort", label: "Order (left → right)", type: "number", value: s.sort || 0, half: true },
     ],
-    onSubmit: async (v) => { await api(s.id ? "PUT" : "POST", "seats" + (s.id ? "/" + s.id : ""), { ...v, user_ids: idList(v.user_ids) }); done(); },
+    onSubmit: async (v) => { await api(s.id ? "PUT" : "POST", "seats" + (s.id ? "/" + s.id : ""), { ...v, user_ids: idList(v.user_ids), team_id: s.team_id || S.teamId }); done(); },
     onDelete: s.id ? async () => { await api("DELETE", "seats/" + s.id); done(); } : null,
   });
 }

@@ -34,7 +34,7 @@ PORT = int(os.environ.get("PORT", "8090"))
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
 SESSION_DAYS = int(os.environ.get("SESSION_DAYS", "30"))
 COOKIE_NAME = "tf_session"
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS teams (
 );
 CREATE TABLE IF NOT EXISTS seats (
   id INTEGER PRIMARY KEY,
+  team_id INTEGER REFERENCES teams(id) ON DELETE CASCADE,
   parent_id INTEGER REFERENCES seats(id) ON DELETE SET NULL,
   title TEXT NOT NULL,
   roles TEXT,
@@ -157,8 +158,8 @@ CREATE INDEX IF NOT EXISTS idx_meas_team ON measurables(team_id);
 # Generic CRUD resources. cols: column -> type. choices: allowed values.
 RESOURCES = {
     "teams": dict(cols={"name": str}, required="name", order="name COLLATE NOCASE", admin_write=True),
-    "seats": dict(cols={"parent_id": int, "title": str, "roles": str, "user_id": int, "sort": int},
-                  order="sort, id"),
+    "seats": dict(cols={"team_id": int, "parent_id": int, "title": str, "roles": str, "user_id": int, "sort": int},
+                  team=True, order="sort, id"),
     "rocks": dict(cols={"team_id": int, "title": str, "description": str, "owner_id": int,
                         "quarter": str, "due_date": str, "status": str},
                   choices={"status": ("on", "off", "done")}, team=True,
@@ -263,6 +264,11 @@ def init_db():
     conn = db()
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    # Migration: accountability charts became per-team. Older seats move to the first team.
+    seat_cols = {r["name"] for r in conn.execute("PRAGMA table_info(seats)")}
+    if "team_id" not in seat_cols:
+        conn.execute("ALTER TABLE seats ADD COLUMN team_id INTEGER REFERENCES teams(id) ON DELETE CASCADE")
+        conn.execute("UPDATE seats SET team_id = (SELECT MIN(id) FROM teams) WHERE team_id IS NULL")
     user_cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
     if "ical_url" not in user_cols:
         conn.execute("ALTER TABLE users ADD COLUMN ical_url TEXT")
@@ -816,6 +822,15 @@ class Handler(BaseHTTPRequestHandler):
         elif multi and multi[0] in values:
             values[multi[1]] = encode_ids([values[multi[0]]] if values[multi[0]] else [])
 
+        if name == "seats" and values.get("parent_id"):
+            parent = conn.execute("SELECT team_id FROM seats WHERE id=?", (values["parent_id"],)).fetchone()
+            team = values.get("team_id")
+            if team is None and ident:
+                cur_row = conn.execute("SELECT team_id FROM seats WHERE id=?", (int(ident),)).fetchone()
+                team = cur_row["team_id"] if cur_row else None
+            if not parent or parent["team_id"] != team:
+                raise ApiError(400, "A seat can only report to a seat on the same team")
+
         required = spec.get("required", "title")
         if method == "POST":
             if not values.get(required):
@@ -848,6 +863,8 @@ class Handler(BaseHTTPRequestHandler):
                 values["solved_at"] = (existing["solved_at"] or now_iso()) if values["status"] == "solved" else None
             if name == "seats" and values.get("parent_id") == rid:
                 raise ApiError(400, "A seat can't report to itself")
+            if name == "seats" and "team_id" in values and existing["team_id"] is not None and values["team_id"] != existing["team_id"]:
+                raise ApiError(400, "Seats can't be moved to another team")
             if values:
                 sets = ", ".join(f"{k}=?" for k in values)
                 conn.execute(f"UPDATE {name} SET {sets} WHERE id=?", [*values.values(), rid])
