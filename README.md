@@ -17,6 +17,9 @@ A small, self-hosted team tool for running your business on EOS®-style practice
 | **Headlines** | Customer and employee news, drop down to issues |
 | **Vision / Traction Organizer** | Core values, core focus, 10-year target, marketing strategy, 3-year picture, 1-year plan; pulls in current rocks and long-term issues. Autosaves |
 | **Accountability Chart** | A separate org chart per team, showing the seats, the people in each seat, and their roles |
+| **Boards** | Kanban boards per team for agile project work. Every card is also a to-do: dragging it to Done checks it off, and checking it off moves it to Done. Cards link to rocks and to any number of people, and have priority, project, phase, workstream and due date. Filters, search, and drag-and-drop (press and hold on phones) |
+| **Milestones** | Any to-do or card can be a milestone. It shows a ◆ Milestone tag and still checks off like a to-do. Rocks show milestone and task progress |
+| **Notion / CSV import** | Upload a Notion database export (zip) or any CSV. You match names to people and values to rocks before importing |
 | **Availability** | Weekly team calendar from everyone's Google Calendar, showing busy blocks per person and highlighting times when everyone is free. Teammates see only busy/free, never event titles |
 | **Live updates** | Changes from friends appear on everyone's screen within about a second, with a note saying who changed what. The sidebar shows who's online, and meetings stay in sync across everyone's screens. Refreshes wait while you're typing |
 | **Teams and people** | Multiple teams, invite-link sign-up, admin-managed accounts, password changes |
@@ -150,6 +153,19 @@ Each person connects their own calendar from the **Availability** page:
 
 Tenfold reads the calendar every few minutes and shows only busy/free times to the team. The secret address is stored on your server and is never shown to other users. The container needs outbound internet access to reach Google, which Unraid allows by default. Any calendar app that offers an iCal (.ics) link works too, such as Outlook or iCloud.
 
+## Importing from Notion
+
+1. In Notion, open the database and choose **··· → Export → Markdown & CSV**.
+2. In Tenfold, open **Boards → Import from Notion / CSV** and upload the zip.
+3. Match each name in the **Owner** column to Tenfold people, and each **Project** to a rock. You can pick several people per name.
+
+Tenfold reads these columns when present: Name/Title, Status, Due, Notes, ID, Priority, Project, Phase, Workstream, Owner. A prepared CSV can also include:
+- **Assignees:** people's names, separated by commas. Used instead of Owner.
+- **Rock:** a rock's title. Used instead of Project for linking to rocks.
+- **Milestone:** Yes/No. A milestone with a rock and no due date gets the rock's due date.
+
+Statuses become the board's columns. A column named Done, Complete, Closed or Shipped counts as done.
+
 ## Letting friends in from outside your house
 
 Don't forward port 8090 straight to the internet. Two good options:
@@ -191,7 +207,7 @@ python3 server.py
 ## Troubleshooting
 
 - **"pull access denied" or "unauthorized" when installing:** the GHCR package is still private (see Part 1, step 4), or the username in the repository field isn't all lowercase.
-- **The page won't load:** check the container log (Docker tab → Tenfold icon → *Logs*). It should say `Tenfold 1.4.0 running on http://0.0.0.0:8090`. Make sure the host port isn't used by another container.
+- **The page won't load:** check the container log (Docker tab → Tenfold icon → *Logs*). It should say `Tenfold 1.6.0 running on http://0.0.0.0:8090`. Make sure the host port isn't used by another container.
 - **You keep getting signed out over plain HTTP:** make sure `COOKIE_SECURE` is `false` unless you're using HTTPS.
 - **Forgot the admin password:** another admin can reset it under Settings → People. If you were the only admin, stop the container, delete `tenfold.db`, and start over (this erases everything), or ask for help resetting it with `sqlite3`.
 

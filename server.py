@@ -5,10 +5,15 @@ Tenfold - a small, self-hosted EOS-style team tool.
 Zero external dependencies: Python 3.10+ standard library + SQLite.
 Run:  python3 server.py      (then open http://localhost:8090)
 """
+import base64
+import csv
 import hashlib
+import io
+import re
 import hmac
 import json
 import mimetypes
+import zipfile
 import os
 import secrets
 import sqlite3
@@ -34,7 +39,7 @@ PORT = int(os.environ.get("PORT", "8090"))
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
 SESSION_DAYS = int(os.environ.get("SESSION_DAYS", "30"))
 COOKIE_NAME = "tf_session"
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -142,6 +147,22 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT
 );
+CREATE TABLE IF NOT EXISTS boards (
+  id INTEGER PRIMARY KEY,
+  team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  sort REAL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS board_columns (
+  id INTEGER PRIMARY KEY,
+  board_id INTEGER NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  color TEXT DEFAULT 'gray',
+  is_done INTEGER NOT NULL DEFAULT 0,
+  sort REAL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS vto (
   team_id INTEGER PRIMARY KEY REFERENCES teams(id) ON DELETE CASCADE,
   data TEXT NOT NULL,
@@ -172,9 +193,16 @@ RESOURCES = {
                    choices={"status": ("open", "solved"), "term": ("short", "long")}, team=True,
                    order="CASE status WHEN 'solved' THEN 1 ELSE 0 END, "
                          "CASE WHEN priority > 0 THEN priority ELSE 99 END, created_at DESC"),
+    # To-dos double as kanban tasks: a to-do with a board_id is a card on that board.
     "todos": dict(cols={"team_id": int, "title": str, "description": str, "owner_id": int,
-                        "due_date": str, "done": int, "issue_id": int},
+                        "due_date": str, "done": int, "issue_id": int,
+                        "board_id": int, "column_id": int, "sort": float, "milestone": int, "rock_id": int,
+                        "ext_key": str, "priority": str, "project": str, "phase": str, "workstream": str},
                   team=True, order="done, due_date IS NULL, due_date, id"),
+    "boards": dict(cols={"team_id": int, "name": str, "sort": float}, required="name", team=True, order="sort, id"),
+    "board_columns": dict(cols={"board_id": int, "name": str, "color": str, "is_done": int, "sort": float},
+                          required="name", parent=("board_id",), order="sort, id",
+                          choices={"color": ("gray", "brown", "orange", "yellow", "green", "blue", "purple", "pink", "red")}),
     "headlines": dict(cols={"team_id": int, "title": str, "owner_id": int, "kind": str, "archived": int},
                       choices={"kind": ("customer", "employee", "general")}, team=True,
                       order="archived, created_at DESC"),
@@ -186,12 +214,22 @@ RESOURCES = {
 
 # Resources that can have several owners. The first owner is also kept in the
 # single-owner column so sorting and older data keep working.
+DEFAULT_COLUMNS = [("Not started", "gray", 0), ("In progress", "blue", 0), ("Done", "green", 1)]
+TODO_TASK_COLUMNS = [  # added to the to-dos table by migration
+    ("board_id", "INTEGER REFERENCES boards(id) ON DELETE CASCADE"),
+    ("column_id", "INTEGER REFERENCES board_columns(id) ON DELETE SET NULL"),
+    ("sort", "REAL DEFAULT 0"), ("milestone", "INTEGER NOT NULL DEFAULT 0"),
+    ("rock_id", "INTEGER REFERENCES rocks(id) ON DELETE SET NULL"),
+    ("ext_key", "TEXT"), ("priority", "TEXT"), ("project", "TEXT"), ("phase", "TEXT"), ("workstream", "TEXT"),
+]
+
 MULTI_OWNER = {
     "rocks": ("owner_id", "owner_ids"),
     "issues": ("owner_id", "owner_ids"),
     "headlines": ("owner_id", "owner_ids"),
     "measurables": ("owner_id", "owner_ids"),
     "seats": ("user_id", "user_ids"),
+    "todos": ("owner_id", "owner_ids"),
 }
 
 
@@ -248,6 +286,161 @@ HUB = Hub()
 SILENT_HEADS = {"login", "logout", "setup", "health", "status", "events"}
 
 
+# ---------------------------------------------------------------- import helpers
+STATUS_ORDER = ["backlog", "not started", "to do", "todo", "planned", "in progress", "doing", "blocked",
+                "in review", "review", "done", "complete", "completed", "closed", "shipped"]
+DONE_RE = re.compile(r"^(done|complete|completed|closed|shipped|finished)$", re.I)
+TRUTHY = {"yes", "true", "checked", "1", "x", "y"}
+STATUS_COLORS = {"not started": "gray", "backlog": "gray", "to do": "gray", "todo": "gray", "in progress": "blue",
+                 "doing": "blue", "blocked": "red", "in review": "purple", "review": "purple"}
+
+
+def read_import_file(filename, data_b64):
+    try:
+        raw = base64.b64decode(data_b64, validate=False)
+    except Exception:
+        raise ApiError(400, "Couldn't read the uploaded file")
+    if not raw:
+        raise ApiError(400, "The file is empty")
+    if len(raw) > 20 * 1024 * 1024:
+        raise ApiError(400, "That file is too large (20 MB max)")
+    name = filename or "import.csv"
+    if raw[:2] == b"PK":
+        def csv_entries(z):
+            found = []
+            for info in z.infolist():
+                low = info.filename.lower()
+                if low.endswith(".csv"):
+                    found.append((info, z))
+                elif low.endswith(".zip"):  # Notion sometimes nests a zip inside the zip
+                    inner = zipfile.ZipFile(io.BytesIO(z.read(info)))
+                    found += csv_entries(inner)
+            return found
+        try:
+            entries = csv_entries(zipfile.ZipFile(io.BytesIO(raw)))
+        except zipfile.BadZipFile:
+            raise ApiError(400, "That zip file looks damaged")
+        if not entries:
+            raise ApiError(400, "No CSV file inside that zip. In Notion, export the database as 'Markdown & CSV'.")
+        # Notion's "_all.csv" has every property; otherwise take the biggest CSV
+        entries.sort(key=lambda e: ("_all" not in e[0].filename, -e[0].file_size))
+        info, z = entries[0]
+        raw, name = z.read(info), info.filename.rsplit("/", 1)[-1]
+    text = raw.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise ApiError(400, "That CSV has no header row")
+    fields = {f.strip().lower(): f for f in reader.fieldnames if f}
+    pick = lambda *names: next((fields[n] for n in names if n in fields), None)
+    f_title = pick("name", "title", "task", "task name")
+    if not f_title:
+        raise ApiError(400, "Couldn't find a Name or Title column")
+    f = {k: pick(*v) for k, v in {
+        "status": ("status", "stage", "state"), "due": ("due", "due date", "deadline", "date"),
+        "notes": ("notes", "description", "details"), "key": ("id", "key", "task id"),
+        "priority": ("priority",), "project": ("project",), "phase": ("phase", "sprint"),
+        "workstream": ("workstream", "area", "team"), "assignees": ("assignees", "assignee"),
+        "owner": ("owner", "owners", "person", "people"), "rock": ("rock",), "milestone": ("milestone", "is milestone"),
+    }.items()}
+    rows = []
+    for rec in reader:
+        get = lambda k: (rec.get(f[k]) or "").strip() if f.get(k) else ""
+        title = (rec.get(f_title) or "").strip()
+        others = [v for k, v in rec.items() if k not in (f_title, "From log") and (v or "").strip()]
+        if not title or not others:  # skip blank rows and the parent page row Notion adds
+            continue
+        people_src = get("assignees") if f.get("assignees") else get("owner")
+        rows.append({
+            "title": title, "status": get("status"), "due": parse_due(get("due")), "notes": get("notes"),
+            "key": get("key"), "priority": get("priority"), "project": get("project"), "phase": get("phase"),
+            "workstream": get("workstream"),
+            "people": [p.strip() for p in re.split(r"[,;]", people_src) if p.strip()],
+            "rock": get("rock") if f.get("rock") else get("project"),
+            "milestone": get("milestone").lower() in TRUTHY,
+        })
+    if not rows:
+        raise ApiError(400, "No tasks found in that file")
+    for r in rows:
+        r["_people_field"] = "Assignees" if f.get("assignees") else ("Owner" if f.get("owner") else None)
+        r["_rock_field"] = "Rock" if f.get("rock") else ("Project" if f.get("project") else None)
+    stem = re.sub(r"\s+[0-9a-f]{32}$", "", re.sub(r"_all$", "", name.rsplit(".", 1)[0])).strip()
+    return rows, stem or "Imported board"
+
+
+def parse_due(v):
+    v = (v or "").split("→")[0].strip()
+    if not v:
+        return None
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%Y/%m/%d", "%Y-%m-%d", "%m/%d/%Y", "%B %d, %Y %I:%M %p", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(v, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", v)
+    return m.group(1) if m else None
+
+
+def analyze_import(rows):
+    statuses = []
+    for r in rows:
+        if r["status"] and r["status"] not in statuses:
+            statuses.append(r["status"])
+    if not statuses:
+        statuses = ["Not started"]
+    rank = lambda s: STATUS_ORDER.index(s.lower()) if s.lower() in STATUS_ORDER else 5.5
+    statuses.sort(key=rank)
+    if not any(DONE_RE.match(s) for s in statuses):
+        statuses.append("Done")
+    columns = [{"name": s, "is_done": bool(DONE_RE.match(s)), "count": sum(1 for r in rows if (r["status"] or statuses[0]) == s),
+                "color": "green" if DONE_RE.match(s) else STATUS_COLORS.get(s.lower(), "gray")} for s in statuses]
+    people, rock_values = {}, {}
+    for r in rows:
+        for p in r["people"]:
+            people[p] = people.get(p, 0) + 1
+        if r["rock"]:
+            rock_values[r["rock"]] = rock_values.get(r["rock"], 0) + 1
+    return {
+        "columns": columns, "milestones": sum(1 for r in rows if r["milestone"]),
+        "people": sorted(people.items(), key=lambda x: -x[1]), "rock_values": sorted(rock_values.items(), key=lambda x: -x[1]),
+        "people_field": rows[0]["_people_field"], "rock_field": rows[0]["_rock_field"],
+    }
+
+
+def _norm(s):
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+def guess_people(name, users):
+    n = _norm(name)
+    if not n:
+        return []
+    for u in users:
+        if _norm(u["name"]) == n or _norm(u["email"].split("@")[0]) == n:
+            return [u["id"]]
+    firsts = [u for u in users if _norm(u["name"]).split(" ")[0] == n.split(" ")[0]]
+    return [firsts[0]["id"]] if len(firsts) == 1 else []
+
+
+def guess_rock(value, rocks):
+    n = _norm(value)
+    if not n:
+        return None
+    for r in rocks:
+        if _norm(r["title"]) == n:
+            return r["id"]
+    for r in rocks:
+        t = _norm(r["title"])
+        if t and (t in n or n in t):
+            return r["id"]
+    words = {w for w in n.split() if len(w) >= 4}
+    best, score = None, 0
+    for r in rocks:
+        overlap = len(words & {w for w in _norm(r["title"] + " " + (r["description"] or "")).split() if len(w) >= 4})
+        if overlap > score:
+            best, score = r["id"], overlap
+    return best
+
+
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -269,6 +462,11 @@ def init_db():
     if "team_id" not in seat_cols:
         conn.execute("ALTER TABLE seats ADD COLUMN team_id INTEGER REFERENCES teams(id) ON DELETE CASCADE")
         conn.execute("UPDATE seats SET team_id = (SELECT MIN(id) FROM teams) WHERE team_id IS NULL")
+    todo_cols = {r["name"] for r in conn.execute("PRAGMA table_info(todos)")}
+    for col, decl in TODO_TASK_COLUMNS:
+        if col not in todo_cols:
+            conn.execute(f"ALTER TABLE todos ADD COLUMN {col} {decl}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_todos_board ON todos(board_id)")
     user_cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
     if "ical_url" not in user_cols:
         conn.execute("ALTER TABLE users ADD COLUMN ical_url TEXT")
@@ -433,7 +631,7 @@ class Handler(BaseHTTPRequestHandler):
             team = self._body.get("team_id")
         elif parts[0] == "vto" and len(parts) > 1 and parts[1].isdigit():
             team = int(parts[1])
-        resource = {"me": "users", "register": "users", "invite": "settings", "scores": "measurables"}.get(parts[0], parts[0])
+        resource = {"me": "users", "register": "users", "invite": "settings", "scores": "measurables", "import": "boards"}.get(parts[0], parts[0])
         if parts[0] == "me" and len(parts) > 1 and parts[1] == "calendar":
             resource = "availability"
         HUB.publish({
@@ -628,6 +826,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if head == "vto":
             return self.vto_api(conn, method, parts, body)
+
+        if head == "import":
+            return self.import_api(conn, method, parts, body)
 
         if head in RESOURCES:
             return self.crud(conn, method, head, parts[1] if len(parts) > 1 else None, body)
@@ -831,12 +1032,18 @@ class Handler(BaseHTTPRequestHandler):
             if not parent or parent["team_id"] != team:
                 raise ApiError(400, "A seat can only report to a seat on the same team")
 
+        if name == "todos" and method in ("POST", "PUT"):
+            self.sync_task_column(conn, values, rid)
+
         required = spec.get("required", "title")
         if method == "POST":
             if not values.get(required):
                 raise ApiError(400, f"{required.capitalize()} is required")
             if spec.get("team") and not values.get("team_id"):
                 raise ApiError(400, "team_id is required")
+            for fk in spec.get("parent", ()):
+                if not values.get(fk):
+                    raise ApiError(400, f"{fk} is required")
             values["created_at"] = now_iso()
             if name == "todos" and values.get("done"):
                 values["done_at"] = now_iso()
@@ -846,6 +1053,10 @@ class Handler(BaseHTTPRequestHandler):
             cur = conn.execute(
                 f"INSERT INTO {name}({','.join(keys)}) VALUES ({','.join('?' * len(keys))})",
                 [values[k] for k in keys])
+            if name == "boards":
+                for i, (col_name, color, done) in enumerate(DEFAULT_COLUMNS):
+                    conn.execute("INSERT INTO board_columns(board_id, name, color, is_done, sort, created_at) VALUES (?,?,?,?,?,?)",
+                                 (cur.lastrowid, col_name, color, done, i, now_iso()))
             return self.out(name, conn.execute(f"SELECT * FROM {name} WHERE id=?", (cur.lastrowid,)).fetchone())
 
         if rid is None:
@@ -868,15 +1079,126 @@ class Handler(BaseHTTPRequestHandler):
             if values:
                 sets = ", ".join(f"{k}=?" for k in values)
                 conn.execute(f"UPDATE {name} SET {sets} WHERE id=?", [*values.values(), rid])
+            if name == "board_columns" and "is_done" in values and values["is_done"] != existing["is_done"]:
+                d = 1 if values["is_done"] else 0
+                conn.execute("UPDATE todos SET done=?, done_at=CASE WHEN ?=1 THEN COALESCE(done_at, ?) ELSE NULL END "
+                             "WHERE column_id=?", (d, d, now_iso(), rid))
             return self.out(name, conn.execute(f"SELECT * FROM {name} WHERE id=?", (rid,)).fetchone())
 
         if method == "DELETE":
+            if name == "board_columns":  # keep the tasks: move them to the nearest remaining column
+                other = conn.execute(
+                    "SELECT * FROM board_columns WHERE board_id=? AND id<>? ORDER BY ABS(sort - ?), sort LIMIT 1",
+                    (existing["board_id"], rid, existing["sort"] or 0)).fetchone()
+                if other:
+                    top = conn.execute("SELECT COALESCE(MAX(sort), 0) FROM todos WHERE column_id=?", (other["id"],)).fetchone()[0]
+                    conn.execute(
+                        "UPDATE todos SET column_id=?, sort=sort+?, done=?, "
+                        "done_at=CASE WHEN ?=1 THEN COALESCE(done_at, ?) ELSE NULL END WHERE column_id=?",
+                        (other["id"], top + 1, other["is_done"], other["is_done"], now_iso(), rid))
             if name == "seats":  # children move up to the deleted seat's parent
                 conn.execute("UPDATE seats SET parent_id=? WHERE parent_id=?", (existing["parent_id"], rid))
             conn.execute(f"DELETE FROM {name} WHERE id=?", (rid,))
             return {"ok": True}
 
         raise ApiError(405, "Method not allowed")
+
+    def sync_task_column(self, conn, values, rid):
+        """Keep a task's column and its to-do checkbox in step: Done column <-> checked."""
+        existing = conn.execute("SELECT * FROM todos WHERE id=?", (rid,)).fetchone() if rid else None
+        board = values["board_id"] if "board_id" in values else (existing["board_id"] if existing else None)
+        if not board:
+            if values.get("column_id"):
+                raise ApiError(400, "A column needs a board")
+            return
+        cols = conn.execute("SELECT * FROM board_columns WHERE board_id=? ORDER BY sort, id", (board,)).fetchall()
+        if not cols:
+            return
+        by_id = {c["id"]: c for c in cols}
+        end_sort = lambda cid: conn.execute("SELECT COALESCE(MAX(sort), -1) + 1 FROM todos WHERE column_id=?", (cid,)).fetchone()[0]
+        first = lambda done: next((c for c in cols if bool(c["is_done"]) == done), cols[0])
+        if values.get("column_id"):
+            col = by_id.get(values["column_id"])
+            if not col:
+                raise ApiError(400, "That column isn't on this board")
+            values["done"] = 1 if col["is_done"] else 0
+            if "sort" not in values and (not existing or existing["column_id"] != col["id"]):
+                values["sort"] = end_sort(col["id"])
+            return
+        current = by_id.get(existing["column_id"]) if existing and existing["column_id"] else None
+        if current is None:  # new task, or a task that just joined this board
+            target = first(bool(values.get("done")))
+        elif "done" in values and bool(values["done"]) != bool(current["is_done"]):
+            target = first(bool(values["done"]))
+        else:
+            return
+        values["column_id"] = target["id"]
+        values["done"] = 1 if target["is_done"] else 0
+        if "sort" not in values:
+            values["sort"] = end_sort(target["id"])
+
+    # ---------- Notion / CSV import ----------
+    def import_api(self, conn, method, parts, body):
+        if method != "POST" or len(parts) < 2 or parts[1] not in ("preview", "run"):
+            raise ApiError(404, "Not found")
+        team_id = coerce(int, body.get("team_id"), "team_id")
+        if not team_id or not conn.execute("SELECT 1 FROM teams WHERE id=?", (team_id,)).fetchone():
+            raise ApiError(400, "Pick a team first")
+        rows, source_name = read_import_file(str(body.get("filename") or ""), str(body.get("data") or ""))
+        info = analyze_import(rows)
+        users = [dict(u) for u in conn.execute("SELECT id, name, email FROM users")]
+        rocks = [dict(r) for r in conn.execute(
+            "SELECT id, title, description, owner_id, owner_ids, due_date, quarter, status FROM rocks WHERE team_id=? "
+            "ORDER BY status='done', quarter DESC, id", (team_id,))]
+        if parts[1] == "preview":
+            return {
+                "board_name": body.get("board_name") or source_name,
+                "total": len(rows), "milestones": info["milestones"], "columns": info["columns"],
+                "people_field": info["people_field"], "rock_field": info["rock_field"],
+                "people": [{"name": n, "count": c, "guess": guess_people(n, users)} for n, c in info["people"]],
+                "rock_values": [{"name": n, "count": c, "guess": guess_rock(n, rocks)} for n, c in info["rock_values"]],
+                "rocks": [{"id": r["id"], "title": r["title"], "quarter": r["quarter"]} for r in rocks],
+            }
+        people_map = body.get("people_map") or {}
+        rock_map = body.get("rock_map") or {}
+        board_name = str(body.get("board_name") or source_name).strip()[:200] or "Imported board"
+        valid_users = {u["id"] for u in users}
+        rock_by_id = {r["id"]: r for r in rocks}
+        now = now_iso()
+        cur = conn.execute("INSERT INTO boards(team_id, name, sort, created_at) VALUES (?,?,?,?)",
+                           (team_id, board_name, time.time(), now))
+        board_id = cur.lastrowid
+        col_ids = {}
+        for i, c in enumerate(info["columns"]):
+            col_ids[c["name"]] = (conn.execute(
+                "INSERT INTO board_columns(board_id, name, color, is_done, sort, created_at) VALUES (?,?,?,?,?,?)",
+                (board_id, c["name"], c["color"], 1 if c["is_done"] else 0, i, now)).lastrowid, c["is_done"])
+        sort_in = {}
+        made = milestones = 0
+        for r in rows:
+            status = r["status"] or info["columns"][0]["name"]
+            col_id, is_done = col_ids[status]
+            owners = []
+            for person in r["people"]:
+                for uid in people_map.get(person) or []:
+                    uid = int(uid)
+                    if uid in valid_users and uid not in owners:
+                        owners.append(uid)
+            rock_id = rock_map.get(r["rock"]) if r["rock"] else None
+            rock_id = int(rock_id) if rock_id and int(rock_id) in rock_by_id else None
+            due = r["due"] or (rock_by_id[rock_id]["due_date"] if r["milestone"] and rock_id else None)
+            sort_in[col_id] = sort_in.get(col_id, -1) + 1
+            conn.execute(
+                "INSERT INTO todos(team_id, title, description, owner_id, owner_ids, due_date, done, done_at, board_id, column_id, "
+                "sort, milestone, rock_id, ext_key, priority, project, phase, workstream, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (team_id, r["title"][:500], r["notes"] or None, owners[0] if owners else None, encode_ids(owners), due,
+                 1 if is_done else 0, None, board_id, col_id,  # already-done imports don't count toward to-do stats sort_in[col_id], 1 if r["milestone"] else 0,
+                 rock_id, r["key"] or None, r["priority"] or None, r["project"] or None, r["phase"] or None,
+                 r["workstream"] or None, now))
+            made += 1
+            milestones += 1 if r["milestone"] else 0
+        return {"board_id": board_id, "tasks": made, "milestones": milestones}
 
     def scores_api(self, conn, method, body):
         if method == "GET":

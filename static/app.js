@@ -186,6 +186,7 @@ const NAV = [
   ["#/todos", "✓", "To-Dos"],
   ["#/issues", "!", "Issues"],
   ["#/headlines", "❝", "Headlines"],
+  ["#/boards", "▦", "Boards"],
   ["#/availability", "▥", "Availability"],
   ["sep"],
   ["#/vto", "◎", "Vision / Traction"],
@@ -214,7 +215,7 @@ async function logout() { await safe(() => api("POST", "logout")); stopLive(); S
 
 const ROUTES = {
   home: pageHome, meetings: pageMeetings, meeting: pageMeeting, scorecard: pageScorecard, rocks: pageRocks,
-  todos: pageTodos, issues: pageIssues, availability: pageAvailability, headlines: pageHeadlines, vto: pageVto, chart: pageChart, settings: pageSettings,
+  todos: pageTodos, issues: pageIssues, availability: pageAvailability, boards: pageBoards, headlines: pageHeadlines, vto: pageVto, chart: pageChart, settings: pageSettings,
 };
 
 let routeSeq = 0;
@@ -235,7 +236,7 @@ async function route(soft = false) {
     return;
   }
   // Live refresh: build the new version off-screen, then swap it in so nothing flickers or jumps.
-  const scrollers = () => [...view.querySelectorAll(".cal-wrap, .sc-wrap, .chart-scroll")];
+  const scrollers = () => [...view.querySelectorAll(".cal-wrap, .sc-wrap, .chart-scroll, .kanban")];
   const saved = scrollers().map((e) => [e.scrollLeft, e.scrollTop]);
   const winY = window.scrollY;
   page.className = "offscreen";
@@ -245,24 +246,32 @@ async function route(soft = false) {
   await safe(() => fn(page, arg));
   if (seq !== routeSeq || !page.isConnected) { page.remove(); return; }
   if (userIsBusy()) { S.timers.forEach(clearInterval); S.timers = oldTimers; page.remove(); live.pending = true; return; }
+  const act = document.activeElement;
+  const refocus = act && act.dataset && act.dataset.liveOk ? [act.dataset.liveOk, act.selectionStart, act.selectionEnd] : null;
   oldTimers.forEach(clearInterval);
   [...view.children].forEach((c) => { if (c !== page) c.remove(); });
   page.className = "";
   scrollers().forEach((e, i) => { if (saved[i]) { e.scrollLeft = saved[i][0]; e.scrollTop = saved[i][1]; } });
   window.scrollTo(0, winY);
+  if (refocus) {
+    const el = page.querySelector(`[data-live-ok="${refocus[0]}"]`);
+    if (el) { el.focus(); try { el.setSelectionRange(refocus[1], refocus[2]); } catch (e) { /* not a text input */ } }
+  }
 }
 
 // ---------------------------------------------------------------- live updates
 const RESOURCE_LABELS = {
   issues: "Issues", todos: "To-Dos", rocks: "Rocks", measurables: "the Scorecard", headlines: "Headlines", meetings: "a meeting",
-  seats: "the Accountability Chart", vto: "the V/TO", users: "People", teams: "Teams", availability: "their calendar", settings: "Settings",
+  seats: "the Accountability Chart", vto: "the V/TO", boards: "Boards", board_columns: "a board", users: "People", teams: "Teams", availability: "their calendar", settings: "Settings",
 };
 const live = { es: null, pending: false, needBasics: false, online: [], version: null, lastToast: {} };
 
 function userIsBusy() {
+  if (S.dragging) return true;
   if ($("#modal-root") && $("#modal-root").children.length) return true;
   const a = document.activeElement;
-  return !!(a && a.closest && a.closest("#view") && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.type !== "checkbox");
+  // Inputs marked data-live-ok (search boxes, filters) don't hold back live refreshes.
+  return !!(a && a.closest && a.closest("#view") && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.type !== "checkbox" && !a.dataset.liveOk);
 }
 
 function startLive() {
@@ -407,37 +416,72 @@ function renderSetup(app) {
 // ---------------------------------------------------------------- shared panels
 // Each panel renders into a card and can be embedded in the meeting runner.
 
+// ---- to-dos (weekly to-dos, board tasks and milestones all live here)
+const TODO_SCOPES = [["all", "All"], ["weekly", "Weekly"], ["tasks", "Board tasks"], ["milestones", "Milestones"]];
+function inScope(t, scope) {
+  if (scope === "weekly") return !t.board_id && !t.milestone;
+  if (scope === "tasks") return !!t.board_id;
+  if (scope === "milestones") return !!t.milestone;
+  // meeting: weekly to-dos, plus board tasks and milestones that are due within a week (or overdue)
+  if (scope === "meeting") return (!t.board_id && !t.milestone) || (!!t.due_date && t.due_date <= addDays(today(), 7));
+  return true;
+}
+let rockCache = { at: 0, list: [] };
+async function allRocks(force) {
+  if (force || Date.now() - rockCache.at > 5000) rockCache = { at: Date.now(), list: await api("GET", "rocks") };
+  return rockCache.list;
+}
+const rockTitle = (id) => ((rockCache.list.find((r) => r.id === id) || {}).title || "");
+function taskTags(t, { showRock = true } = {}) {
+  return [
+    t.milestone ? h("span", { class: "mtag", title: "Milestone" }, "◆ Milestone") : null,
+    t.ext_key ? h("span", { class: "tag ktag-key", title: "Board task" }, t.ext_key) : (t.board_id ? h("span", { class: "tag", title: "Board task" }, "Board") : null),
+    showRock && t.rock_id && rockTitle(t.rock_id) ? h("span", { class: "rtag", title: "Rock: " + rockTitle(t.rock_id) }, "▲ " + rockTitle(t.rock_id)) : null,
+  ];
+}
+
 async function todosPanel(el, opts = {}) {
-  const { teamId, ownerId, showDone = false, compact = false, title = "To-Dos", onChange } = opts;
+  const { teamId, ownerId, showDone = false, compact = false, title = "To-Dos", onChange, meeting = false } = opts;
+  const scopeKey = meeting ? "tf_todo_scope_meeting" : "tf_todo_scope";
+  const scopes = meeting ? [["meeting", "Due this week"], ["all", "All"]] : TODO_SCOPES;
+  let scope = store.get(scopeKey);
+  if (!scopes.some(([k]) => k === scope)) scope = scopes[0][0];
   const q = new URLSearchParams();
   if (teamId) q.set("team_id", teamId);
   if (ownerId) q.set("owner_id", ownerId);
   q.set("since", new Date(Date.now() - 7 * 864e5).toISOString());
-  let items = await api("GET", "todos?" + q);
+  let [items] = await Promise.all([api("GET", "todos?" + q), allRocks()]);
   if (!showDone) items = items.filter((t) => !t.done || (t.done_at && Date.now() - new Date(t.done_at) < 7 * 864e5));
   const reload = () => { el.innerHTML = ""; todosPanel(el, opts); onChange && onChange(); };
+  const counts = Object.fromEntries(scopes.map(([k]) => [k, items.filter((t) => !t.done && inScope(t, k)).length]));
+  const shown = items.filter((t) => inScope(t, scope));
   const list = h("ul", { class: "rows" });
-  if (!items.length) list.append(h("li", { class: "empty" }, "Nothing to do. Nice."));
-  for (const t of items) {
+  if (!shown.length) list.append(h("li", { class: "empty" }, scope === "milestones" ? "No milestones here yet." : "Nothing to do. Nice."));
+  for (const t of shown) {
     const overdue = !t.done && t.due_date && t.due_date < today();
-    list.append(h("li", { class: "rowi" + (t.done ? " done" : "") },
+    list.append(h("li", { class: "rowi" + (t.done ? " done" : "") + (t.milestone ? " milestone" : "") },
       h("input", { type: "checkbox", class: "check", checked: !!t.done, "aria-label": "Done", onchange: (e) => safe(async () => { await api("PUT", "todos/" + t.id, { done: e.target.checked ? 1 : 0 }); reload(); }) }),
-      h("div", { class: "title", onclick: () => editTodo(t, reload) }, h("div", { class: "t" }, t.title), t.description && !compact ? h("div", { class: "d" }, t.description) : null),
+      h("div", { class: "title", onclick: () => editTodo(t, reload) },
+        h("div", { class: "t" }, t.title),
+        h("div", { class: "tags" }, taskTags(t)),
+        t.description && !compact && !t.board_id ? h("div", { class: "d" }, t.description) : null),
       !teamId ? h("span", { class: "tag" }, teamName(t.team_id)) : null,
       h("span", { class: "meta" + (overdue ? " overdue" : "") }, t.due_date ? (overdue ? "Overdue · " : "Due ") + fmtDate(t.due_date) : ""),
-      avatar(t.owner_id)));
+      avatars(ownersOf(t))));
   }
   const qa = h("input", { placeholder: "Add a to-do and press Enter…", "aria-label": "New to-do" });
   qa.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && qa.value.trim()) safe(async () => {
-      await api("POST", "todos", { title: qa.value.trim(), team_id: teamId || S.teamId, owner_id: ownerId || S.me.id, due_date: addDays(today(), 7) });
+      await api("POST", "todos", { title: qa.value.trim(), team_id: teamId || S.teamId, owner_id: ownerId || S.me.id, due_date: addDays(today(), 7), milestone: scope === "milestones" ? 1 : 0 });
       reload();
     });
   });
-  const open = items.filter((t) => !t.done).length;
+  const seg = h("div", { class: "seg" }, scopes.map(([k, label]) => h("button", {
+    class: scope === k ? "on" : "", onclick: () => { store.set(scopeKey, k); reload(); },
+  }, label, counts[k] ? h("span", { class: "segn" }, counts[k]) : null)));
   el.append(h("div", { class: "card" },
-    h("div", { class: "card-head" }, h("h2", {}, title), h("span", { class: "pill neutral" }, `${open} open`), h("span", { class: "spacer" }),
-      h("button", { class: "btn small", onclick: () => editTodo({ team_id: teamId || S.teamId, owner_id: ownerId || S.me.id, due_date: addDays(today(), 7) }, reload) }, "+ To-Do")),
+    h("div", { class: "card-head" }, h("h2", {}, title), seg, h("span", { class: "spacer" }),
+      h("button", { class: "btn small", onclick: () => editTodo({ team_id: teamId || S.teamId, owner_id: ownerId || S.me.id, due_date: addDays(today(), 7), milestone: scope === "milestones" ? 1 : 0 }, reload) }, "+ To-Do")),
     list, S.teamId ? h("div", { class: "quick-add" }, qa) : null));
 }
 
@@ -452,29 +496,453 @@ async function createTodosForOwners(v, extra = {}) {
   if (owner_ids.length > 1) toast(`Created ${owner_ids.length} to-dos`);
 }
 
-function editTodo(t, done) {
+// One editor for every kind of to-do. Board tasks are shared by their owners; weekly to-dos are copied per person.
+async function editTodo(t, done, ctx = {}) {
+  const teamId = t.team_id || S.teamId;
+  const [rocks, columns] = await Promise.all([
+    allRocks(true),
+    t.board_id ? (ctx.columns ? Promise.resolve(ctx.columns) : api("GET", "board_columns?board_id=" + t.board_id)) : Promise.resolve(null),
+  ]);
+  const teamRocks = rocks.filter((r) => r.team_id === teamId).sort((a, b) => (a.status === "done") - (b.status === "done") || String(b.quarter).localeCompare(String(a.quarter)));
+  const rockField = { name: "rock_id", label: "Rock", type: "select", value: t.rock_id || "", options: [["", "No rock"], ...teamRocks.map((r) => [r.id, `${r.title}${r.quarter ? " · " + r.quarter : ""}`])] };
+  const milestoneField = { name: "milestone", label: "Milestone (shows a Milestone tag; still checks off like a to-do)", type: "checkbox", value: t.milestone };
+  const isTask = !!t.board_id;
+  const fields = isTask ? [
+    { name: "title", label: "Title", value: t.title, required: true },
+    { name: "description", label: "Description", type: "textarea", value: t.description, rows: 5 },
+    { name: "column_id", label: "Status", type: "select", options: columns.map((c) => [c.id, c.name]), value: t.column_id || (columns[0] || {}).id, half: true },
+    { name: "due_date", label: "Due", type: "date", value: t.due_date, half: true },
+    ownersField(ownersOf(t).length ? ownersOf(t) : idList(t.owner_ids || []), { required: false, hint: "Everyone picked shares this task." }),
+    rockField,
+    { name: "priority", label: "Priority", type: "select", options: [["", "None"], ["P0", "P0 · urgent"], ["P1", "P1 · high"], ["P2", "P2 · normal"]], value: t.priority || "", half: true },
+    { name: "project", label: "Project", value: t.project, half: true },
+    { name: "phase", label: "Phase", value: t.phase, half: true },
+    { name: "workstream", label: "Workstream", value: t.workstream, half: true },
+    milestoneField,
+  ] : [
+    { name: "title", label: "Title", value: t.title, required: true },
+    { name: "description", label: "Details", type: "textarea", value: t.description, rows: 3 },
+    ownersField([t.owner_id], t.id ? { hint: "Adding people gives each of them their own copy of this to-do." } : {}),
+    { name: "due_date", label: "Due", type: "date", value: t.due_date, half: true },
+    { name: "team_id", label: "Team", type: "select", options: S.teams.map((x) => [x.id, x.name]), value: teamId, half: true },
+    rockField,
+    milestoneField,
+  ];
   formModal({
-    title: t.id ? "Edit to-do" : "New to-do",
-    fields: [
-      { name: "title", label: "Title", value: t.title, required: true },
-      { name: "description", label: "Details", type: "textarea", value: t.description, rows: 3 },
-      ownersField([t.owner_id], t.id ? { hint: "Adding people gives each of them their own copy of this to-do." } : {}),
-      { name: "due_date", label: "Due", type: "date", value: t.due_date },
-      { name: "team_id", label: "Team", type: "select", options: S.teams.map((x) => [x.id, x.name]), value: t.team_id },
-    ],
+    title: (t.id ? "Edit " : "New ") + (isTask ? "task" : "to-do") + (t.ext_key ? " · " + t.ext_key : ""),
+    fields,
+    submitLabel: t.id ? "Save" : "Add",
     onSubmit: async (v) => {
-      if (!t.id) { await createTodosForOwners(v); done(); return; }
+      const common = { rock_id: v.rock_id ? Number(v.rock_id) : null, milestone: v.milestone ? 1 : 0 };
+      if (isTask) {
+        const body = { ...v, ...common, owner_ids: idList(v.owner_ids), column_id: Number(v.column_id), board_id: t.board_id, team_id: teamId };
+        if (t.id && body.column_id === t.column_id) delete body.column_id; // unchanged: keep its place in the column
+        await api(t.id ? "PUT" : "POST", "todos" + (t.id ? "/" + t.id : ""), body);
+        done();
+        return;
+      }
+      if (!t.id) { await createTodosForOwners({ ...v, ...common }); done(); return; }
       const { owner_ids, ...rest } = v;
       const ids = idList(owner_ids);
       const keep = ids.includes(t.owner_id) ? t.owner_id : ids[0];
-      await api("PUT", "todos/" + t.id, { ...rest, owner_id: keep });
+      await api("PUT", "todos/" + t.id, { ...rest, ...common, owner_id: keep, owner_ids: [keep] });
       const others = ids.filter((x) => x !== keep);
-      for (const o of others) await api("POST", "todos", { ...rest, owner_id: o, issue_id: t.issue_id });
+      for (const o of others) await api("POST", "todos", { ...rest, ...common, owner_id: o, issue_id: t.issue_id });
       if (others.length) toast(`Added a copy for ${others.length} more ${others.length === 1 ? "person" : "people"}`);
       done();
     },
     onDelete: t.id ? async () => { await api("DELETE", "todos/" + t.id); done(); } : null,
+    extraButtons: isTask && t.id ? (close) => [h("button", {
+      class: "btn", type: "button", title: "Add this task to the team's Issues list",
+      onclick: () => safe(async () => { await api("POST", "issues", { title: t.title, description: t.description, team_id: teamId, owner_ids: ownersOf(t) }); close(); toast("Added to Issues"); }),
+    }, "Make it an issue")] : null,
   });
+}
+
+// ---- kanban boards (cards are to-dos)
+const KCOLORS = ["gray", "brown", "orange", "yellow", "green", "blue", "purple", "pink", "red"];
+const tagColor = (t) => KCOLORS[[...t.toLowerCase()].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7) % KCOLORS.length];
+const colorOptions = () => KCOLORS.map((c) => [c, c[0].toUpperCase() + c.slice(1)]);
+const boardFilter = { q: "", mine: false, priority: "", project: "", phase: "", workstream: "", rock: "", milestones: false };
+
+async function pageBoards(view) {
+  if (needTeam(view)) return;
+  const [boards] = await Promise.all([api("GET", "boards?team_id=" + S.teamId), allRocks(true)]);
+  const reload = () => route();
+  const key = "tf_board_" + S.teamId;
+  const board = boards.find((b) => String(b.id) === store.get(key)) || boards[0];
+
+  const newBoard = () => formModal({
+    title: "New board",
+    fields: [{ name: "name", label: "Board name", required: true, placeholder: "e.g. Product launch, Website, Hiring" }],
+    submitLabel: "Create board",
+    onSubmit: async (v) => { const b = await api("POST", "boards", { ...v, team_id: S.teamId, sort: Date.now() / 1000 }); store.set(key, b.id); reload(); },
+  });
+  const importBtn = h("button", { class: "btn", onclick: () => importWizard(key) }, "Import from Notion / CSV");
+  view.append(pageHead("Boards", teamName(S.teamId) + " · every card is also a to-do", importBtn));
+
+  if (!board) {
+    view.append(h("div", { class: "card empty" },
+      h("p", {}, "Boards are kanban lists for your team's projects. Every card is also a to-do: dragging it to Done checks it off, and checking it off moves it to Done."),
+      h("div", { class: "toolbar", style: { justifyContent: "center" } },
+        h("button", { class: "btn primary", onclick: newBoard }, "Create a board"), h("button", { class: "btn", onclick: () => importWizard(key) }, "Import from Notion / CSV"))));
+    return;
+  }
+  store.set(key, board.id);
+  const editBoard = (b) => formModal({
+    title: "Board settings",
+    fields: [{ name: "name", label: "Board name", value: b.name, required: true, hint: "Deleting a board also deletes its tasks." }],
+    onSubmit: async (v) => { await api("PUT", "boards/" + b.id, v); reload(); },
+    onDelete: async () => { await api("DELETE", "boards/" + b.id); store.set(key, ""); reload(); },
+  });
+  view.append(h("div", { class: "board-tabs" },
+    boards.map((b) => h("button", { class: "btab" + (b.id === board.id ? " on" : ""), onclick: () => { store.set(key, b.id); reload(); } }, b.name,
+      b.id === board.id ? h("span", { class: "bmenu", title: "Rename or delete board", onclick: (e) => { e.stopPropagation(); editBoard(b); } }, "⋯") : null)),
+    h("button", { class: "btab add", onclick: newBoard }, "+ New board")));
+
+  const [columns, cards] = await Promise.all([api("GET", "board_columns?board_id=" + board.id), api("GET", "todos?board_id=" + board.id)]);
+  const colById = new Map(columns.map((c) => [c.id, c]));
+
+  // filters
+  const distinct = (k) => [...new Set(cards.map((c) => c[k]).filter(Boolean))].sort();
+  const filterSelect = (k, label, values) => values.length ? h("select", {
+    class: "input fsel", "data-live-ok": "bf-" + k, "aria-label": label,
+    onchange: (e) => { boardFilter[k] = e.target.value; draw(); },
+  }, h("option", { value: "" }, label + ": all"), values.map(([v, l]) => h("option", { value: v, selected: String(boardFilter[k]) === String(v) }, l))) : null;
+  const search = h("input", { class: "input kq", type: "search", placeholder: "Search…", value: boardFilter.q, "aria-label": "Search tasks", "data-live-ok": "bf-q" });
+  let qT;
+  search.addEventListener("input", () => { clearTimeout(qT); qT = setTimeout(() => { boardFilter.q = search.value; draw(); }, 150); });
+  const toggle = (k, label) => {
+    const b = h("button", { class: "btn small" + (boardFilter[k] ? " primary" : ""), onclick: () => { boardFilter[k] = !boardFilter[k]; b.classList.toggle("primary", boardFilter[k]); draw(); } }, label);
+    return b;
+  };
+  const usedRocks = [...new Set(cards.map((c) => c.rock_id).filter(Boolean))].map((id) => [id, rockTitle(id) || "Rock " + id]);
+  const counter = h("span", { class: "meta" });
+  view.append(h("div", { class: "filters" }, search, toggle("mine", "Mine"), toggle("milestones", "◆ Milestones"),
+    filterSelect("priority", "Priority", distinct("priority").map((v) => [v, v])),
+    filterSelect("rock", "Rock", usedRocks),
+    filterSelect("project", "Project", distinct("project").map((v) => [v, v])),
+    filterSelect("phase", "Phase", distinct("phase").map((v) => [v, v])),
+    filterSelect("workstream", "Workstream", distinct("workstream").map((v) => [v, v])),
+    h("span", { style: { flex: 1 } }), counter));
+
+  const kanban = h("div", { class: "kanban" });
+  view.append(kanban);
+  const visible = (c) => {
+    const f = boardFilter;
+    if (f.mine && !ownersOf(c).includes(S.me.id)) return false;
+    if (f.milestones && !c.milestone) return false;
+    for (const k of ["priority", "project", "phase", "workstream"]) if (f[k] && c[k] !== f[k]) return false;
+    if (f.rock && String(c.rock_id) !== String(f.rock)) return false;
+    const q = f.q.trim().toLowerCase();
+    return !q || [c.title, c.description, c.ext_key, c.project].some((x) => (x || "").toLowerCase().includes(q));
+  };
+  const cardsIn = (colId) => cards.filter((c) => c.column_id === colId).sort((a, b) => a.sort - b.sort || a.id - b.id);
+  const prioClass = { P0: "red", P1: "orange", P2: "gray" };
+
+  function cardEl(c) {
+    const col = colById.get(c.column_id) || {};
+    const overdue = c.due_date && c.due_date < today() && !col.is_done;
+    const owners = ownersOf(c);
+    return h("div", { class: "kcard" + (c.milestone ? " milestone" : ""), "data-id": c.id, tabindex: 0, onkeydown: (e) => { if (e.key === "Enter") openCard(c); } },
+      c.ext_key || c.priority ? h("div", { class: "ktop" }, c.ext_key ? h("span", { class: "kkey" }, c.ext_key) : null,
+        c.priority ? h("span", { class: "kprio c-" + (prioClass[c.priority] || "gray") }, c.priority) : null) : null,
+      h("div", { class: "kt" }, c.title),
+      c.milestone || c.rock_id || c.project ? h("div", { class: "ktags" },
+        c.milestone ? h("span", { class: "mtag" }, "◆ Milestone") : null,
+        c.rock_id && rockTitle(c.rock_id) ? h("span", { class: "rtag", title: "Rock" }, "▲ " + rockTitle(c.rock_id)) : null,
+        c.project ? h("span", { class: "ktag c-" + tagColor(c.project) }, c.project) : null) : null,
+      c.due_date || owners.length || c.description ? h("div", { class: "kmeta" },
+        c.due_date ? h("span", { class: "kdue" + (overdue ? " overdue" : "") }, "◷ " + fmtDate(c.due_date)) : null,
+        c.description ? h("span", { title: "Has a description" }, "≡") : null,
+        h("span", { style: { flex: 1 } }), owners.length ? avatars(owners) : null) : null);
+  }
+
+  function draw() {
+    const sx = kanban.scrollLeft;
+    kanban.replaceChildren();
+    let shown = 0;
+    columns.forEach((col, ci) => {
+      const inCol = cardsIn(col.id), vis = inCol.filter(visible);
+      shown += vis.length;
+      const list = h("div", { class: "kcards", "data-col": col.id }, vis.map(cardEl));
+      const adder = h("button", { class: "kadd", onclick: () => quickAdd(col, list, adder) }, "+ New");
+      kanban.append(h("div", { class: "kcol", "data-col": col.id },
+        h("div", { class: "khead" },
+          h("span", { class: "kname c-" + (col.color || "gray") }, col.name),
+          h("span", { class: "kcount" }, vis.length === inCol.length ? inCol.length : `${vis.length}/${inCol.length}`),
+          col.is_done ? h("span", { class: "kdone", title: "Cards here count as done" }, "✓") : null,
+          h("span", { style: { flex: 1 } }),
+          h("button", { class: "kicon", title: "Column settings", onclick: () => editColumn(col, ci) }, "⋯"),
+          h("button", { class: "kicon", title: "Add a task", onclick: () => editTodo({ board_id: board.id, column_id: col.id, team_id: S.teamId, owner_ids: [S.me.id] }, reload, { columns }) }, "+")),
+        list, adder));
+    });
+    kanban.append(h("div", { class: "kcol ghostcol" }, h("button", {
+      class: "kadd", onclick: () => formModal({
+        title: "New column",
+        fields: [{ name: "name", label: "Column name", required: true },
+          { name: "color", label: "Color", type: "select", options: colorOptions(), value: KCOLORS[columns.length % KCOLORS.length] },
+          { name: "is_done", label: "Cards in this column count as done", type: "checkbox", value: 0 }],
+        onSubmit: async (v) => { await api("POST", "board_columns", { ...v, board_id: board.id, sort: (columns.length ? columns[columns.length - 1].sort : 0) + 1 }); reload(); },
+      }),
+    }, "+ Add column")));
+    counter.textContent = shown === cards.length ? `${cards.length} tasks` : `${shown} of ${cards.length} tasks`;
+    kanban.scrollLeft = sx;
+  }
+
+  function openCard(c) { editTodo(c, reload, { columns }); }
+
+  function quickAdd(col, list, adder) {
+    const inp = h("textarea", { class: "kinput", rows: 2, placeholder: "Type a name, then press Enter…" });
+    const box = h("div", { class: "kcard editing" }, inp);
+    list.append(box);
+    adder.style.display = "none";
+    inp.focus();
+    const close = () => { box.remove(); adder.style.display = ""; };
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") close();
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        const title = inp.value.trim();
+        if (!title) { close(); return; }
+        inp.value = "";
+        safe(async () => {
+          const c = await api("POST", "todos", { board_id: board.id, column_id: col.id, team_id: S.teamId, title, owner_ids: [S.me.id] });
+          cards.push(c);
+          box.before(cardEl(c));
+          const cnt = list.parentElement.querySelector(".kcount");
+          if (cnt) cnt.textContent = cardsIn(col.id).length;
+        });
+      }
+    });
+    inp.addEventListener("blur", () => setTimeout(() => { if (box.isConnected && !inp.value.trim() && document.activeElement !== inp) close(); }, 150));
+  }
+
+  function editColumn(col, ci) {
+    const swap = async (dir) => {
+      const other = columns[ci + dir];
+      if (!other) return;
+      const a = col.sort, b = other.sort === col.sort ? col.sort + dir : other.sort;
+      await api("PUT", "board_columns/" + col.id, { sort: b });
+      await api("PUT", "board_columns/" + other.id, { sort: a });
+      reload();
+    };
+    formModal({
+      title: "Column",
+      fields: [
+        { name: "name", label: "Name", value: col.name, required: true },
+        { name: "color", label: "Color", type: "select", options: colorOptions(), value: col.color || "gray" },
+        { name: "is_done", label: "Cards in this column count as done (their to-dos are checked off)", type: "checkbox", value: col.is_done },
+      ],
+      onSubmit: async (v) => { await api("PUT", "board_columns/" + col.id, v); reload(); },
+      onDelete: columns.length > 1 ? async () => { await api("DELETE", "board_columns/" + col.id); reload(); } : null,
+      extraButtons: (c) => [
+        ci > 0 ? h("button", { class: "btn", type: "button", onclick: () => safe(async () => { c(); await swap(-1); }) }, "← Move") : null,
+        ci < columns.length - 1 ? h("button", { class: "btn", type: "button", onclick: () => safe(async () => { c(); await swap(1); }) }, "Move →") : null,
+      ],
+    });
+  }
+
+  // Drag and drop with pointer events (mouse, pen and touch).
+  // On touch, press and hold briefly before dragging, so a normal swipe still scrolls the board.
+  let justDragged = 0;
+  kanban.addEventListener("click", (e) => {
+    const el = e.target.closest(".kcard:not(.editing)");
+    if (!el || Date.now() - justDragged < 300) return;
+    const c = cards.find((x) => x.id === Number(el.dataset.id));
+    if (c) openCard(c);
+  });
+  kanban.addEventListener("contextmenu", (e) => { if (e.target.closest(".kcard")) e.preventDefault(); }); // long-press menu on phones
+  // A sideways swipe that would go past the board's edge triggers the browser's back/forward gesture
+  // on some phones. Swallow just those edge swipes; normal scrolling is untouched.
+  let tx = 0, ty = 0;
+  kanban.addEventListener("touchstart", (e) => { tx = e.touches[0].clientX; ty = e.touches[0].clientY; }, { passive: true });
+  kanban.addEventListener("touchmove", (e) => {
+    if (S.dragging || e.touches.length !== 1) return;
+    const dx = e.touches[0].clientX - tx, dy = e.touches[0].clientY - ty;
+    if (Math.abs(dx) <= Math.abs(dy)) return;
+    const atLeft = kanban.scrollLeft <= 0, atRight = kanban.scrollLeft + kanban.clientWidth >= kanban.scrollWidth - 1;
+    if ((dx > 0 && atLeft) || (dx < 0 && atRight)) e.preventDefault();
+  }, { passive: false });
+  kanban.addEventListener("pointerdown", (e) => {
+    const card = e.target.closest(".kcard:not(.editing)");
+    if (!card || e.button !== 0 || e.target.closest("button, a, input, textarea, select")) return;
+    const touch = e.pointerType === "touch";
+    const sx = e.clientX, sy = e.clientY;
+    let armed = !touch, dragging = false, finished = false, ghost, ph, offX, offY, lastX = sx, lastY = sy, raf;
+    const holdT = touch ? setTimeout(() => { armed = true; card.classList.add("armed"); if (navigator.vibrate) navigator.vibrate(15); }, 280) : null;
+    const blockScroll = (ev) => { if (armed) ev.preventDefault(); };
+    card.addEventListener("touchmove", blockScroll, { passive: false });
+
+    const start = () => {
+      dragging = true;
+      S.dragging = true;
+      const r = card.getBoundingClientRect();
+      offX = sx - r.left; offY = sy - r.top;
+      ghost = card.cloneNode(true);
+      ghost.classList.add("kghost");
+      ghost.classList.remove("kcard", "armed");
+      ghost.style.width = r.width + "px";
+      document.body.append(ghost);
+      ph = h("div", { class: "kph", style: { height: r.height + "px" } });
+      card.after(ph);
+      card.style.display = "none";
+      document.body.classList.add("kdragging");
+    };
+    const place = () => {
+      ghost.style.transform = `translate(${lastX - offX}px, ${lastY - offY}px) rotate(2deg)`;
+      const under = document.elementFromPoint(lastX, lastY);
+      const colEl = under && under.closest(".kcol:not(.ghostcol)");
+      const list = colEl && colEl.querySelector(".kcards");
+      if (list) {
+        const after = [...list.querySelectorAll(".kcard")].filter((x) => x !== card)
+          .find((x) => { const r = x.getBoundingClientRect(); return lastY < r.top + r.height / 2; });
+        if (after) { if (ph.nextSibling !== after) list.insertBefore(ph, after); }
+        else if (list.lastElementChild !== ph) list.append(ph);
+      }
+      const kr = kanban.getBoundingClientRect();
+      if (lastX > kr.right - 70) kanban.scrollLeft += 14;
+      else if (lastX < kr.left + 70) kanban.scrollLeft -= 14;
+    };
+    const cleanup = () => {
+      clearTimeout(holdT);
+      card.classList.remove("armed");
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+      window.removeEventListener("touchend", up);
+      window.removeEventListener("touchcancel", up);
+      card.removeEventListener("touchmove", blockScroll);
+    };
+    function move(ev) {
+      lastX = ev.clientX; lastY = ev.clientY;
+      if (!dragging) {
+        const dist = Math.hypot(ev.clientX - sx, ev.clientY - sy);
+        if (!armed) { if (dist > 8) cleanup(); return; } // touch moved before the hold finished: it's a scroll
+        if (dist < 6) return;
+        start();
+      }
+      ev.preventDefault();
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(place);
+    }
+    function up() {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      if (!dragging) return;
+      cancelAnimationFrame(raf);
+      ghost.remove();
+      document.body.classList.remove("kdragging");
+      const list = ph.parentElement;
+      const prevEl = ph.previousElementSibling, nextEl = ph.nextElementSibling;
+      ph.replaceWith(card);
+      card.style.display = "";
+      S.dragging = false;
+      justDragged = Date.now();
+      const c = cards.find((x) => x.id === Number(card.dataset.id));
+      if (!list || !c) return;
+      const sortOf = (el) => (el && el.classList.contains("kcard") ? (cards.find((x) => x.id === Number(el.dataset.id)) || {}).sort : undefined);
+      const a = sortOf(prevEl), b = sortOf(nextEl);
+      const newSort = a != null && b != null ? (a + b) / 2 : a != null ? a + 1 : b != null ? b - 1 : 0;
+      const newCol = Number(list.dataset.col);
+      if (newCol === c.column_id && newSort === c.sort) return;
+      const before = { column_id: c.column_id, sort: c.sort, done: c.done };
+      Object.assign(c, { column_id: newCol, sort: newSort, done: (colById.get(newCol) || {}).is_done ? 1 : 0 });
+      draw();
+      api("PUT", "todos/" + c.id, { column_id: newCol, sort: newSort })
+        .catch((err) => { Object.assign(c, before); draw(); toast(err.message, true); });
+    }
+    window.addEventListener("pointermove", move, { passive: false });
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+    window.addEventListener("touchend", up);
+    window.addEventListener("touchcancel", up);
+  });
+
+  draw();
+}
+
+// ---- import from Notion (zip or CSV) or any CSV
+function importWizard(boardKey) {
+  const file = h("input", { type: "file", accept: ".zip,.csv,text/csv,application/zip" });
+  const status = h("div", { class: "hint" });
+  const body = h("div", {},
+    h("p", { class: "muted", style: { marginTop: 0 } }, "In Notion, open the database, choose ··· → Export → Markdown & CSV, then upload the zip here. A plain CSV works too."),
+    h("div", { class: "field" }, h("label", {}, "File"), file), status);
+  let state = null;
+  const close = openModal("Import tasks", body, (c) => [h("span", { class: "spacer" }), h("button", { class: "btn", onclick: c }, "Cancel")]);
+  file.addEventListener("change", () => safe(async () => {
+    const f = file.files[0];
+    if (!f) return;
+    if (f.size > 20 * 1024 * 1024) { toast("That file is too large (20 MB max)", true); return; }
+    status.textContent = "Reading…";
+    const data = await new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = () => res(String(r.result).split(",")[1] || "");
+      r.onerror = () => rej(new Error("Couldn't read the file"));
+      r.readAsDataURL(f);
+    });
+    let preview;
+    try { preview = await api("POST", "import/preview", { team_id: S.teamId, filename: f.name, data }); }
+    catch (e) { status.textContent = e.message; throw e; }
+    state = { filename: f.name, data, preview };
+    close();
+    importReview(state, boardKey);
+  }));
+}
+
+function importReview(state, boardKey) {
+  const p = state.preview;
+  const name = h("input", { class: "input", value: p.board_name });
+  const peoplePickers = p.people.map((person) => {
+    const sel = new Set((person.guess || []).map(String));
+    const chips = h("div", { class: "chips" }, S.users.map((u) => h("label", { class: "chip" },
+      h("input", { type: "checkbox", value: u.id, checked: sel.has(String(u.id)) }), avatar(u.id), h("span", {}, u.name))));
+    return { person, chips };
+  });
+  const rockOptions = [["", "No rock"], ...p.rocks.map((r) => [r.id, `${r.title}${r.quarter ? " · " + r.quarter : ""}`])];
+  const rockPickers = p.rock_values.map((rv) => {
+    const sel = h("select", { class: "input" }, rockOptions.map(([v, l]) => h("option", { value: v, selected: String(rv.guess || "") === String(v) }, l)));
+    return { rv, sel };
+  });
+  const unmatched = () => peoplePickers.filter((x) => !x.chips.querySelector("input:checked")).length;
+  const body = h("div", { class: "import-review" },
+    h("div", { class: "stats", style: { marginBottom: "14px" } },
+      h("div", { class: "stat" }, h("div", { class: "n" }, p.total), h("div", { class: "l" }, "tasks")),
+      h("div", { class: "stat" }, h("div", { class: "n" }, p.milestones), h("div", { class: "l" }, "milestones")),
+      h("div", { class: "stat" }, h("div", { class: "n" }, p.columns.length), h("div", { class: "l" }, "columns: " + p.columns.map((c) => c.name).join(", ")))),
+    h("div", { class: "field" }, h("label", {}, "Board name"), name),
+    p.people.length ? [h("h4", {}, `People (from the "${p.people_field}" column)`),
+      h("p", { class: "hint" }, "Pick who each name or role should be assigned to. Tasks can have several people."),
+      peoplePickers.map(({ person, chips }) => h("div", { class: "map-row" }, h("div", { class: "map-from" }, person.name, h("span", { class: "muted" }, ` · ${person.count}`)), chips))] : null,
+    p.rock_values.length ? [h("h4", {}, `Rocks (from the "${p.rock_field}" column)`),
+      h("p", { class: "hint" }, "Link tasks to this team's rocks."),
+      rockPickers.map(({ rv, sel }) => h("div", { class: "map-row" }, h("div", { class: "map-from" }, rv.name, h("span", { class: "muted" }, ` · ${rv.count}`)), sel))] : null);
+  openModal("Review import", body, (c) => [
+    h("span", { class: "spacer" }),
+    h("button", { class: "btn", onclick: c }, "Cancel"),
+    h("button", {
+      class: "btn primary", onclick: (e) => safe(async () => {
+        const left = unmatched();
+        if (left && !confirm(`${left} name${left === 1 ? " isn't" : "s aren't"} matched to anyone. Those tasks will be unassigned. Import anyway?`)) return;
+        e.target.disabled = true;
+        e.target.textContent = "Importing…";
+        try {
+          const res = await api("POST", "import/run", {
+            team_id: S.teamId, filename: state.filename, data: state.data, board_name: name.value.trim() || p.board_name,
+            people_map: Object.fromEntries(peoplePickers.map(({ person, chips }) => [person.name, [...chips.querySelectorAll("input:checked")].map((i) => Number(i.value))])),
+            rock_map: Object.fromEntries(rockPickers.map(({ rv, sel }) => [rv.name, sel.value ? Number(sel.value) : null])),
+          });
+          store.set(boardKey, res.board_id);
+          c();
+          toast(`Imported ${res.tasks} tasks${res.milestones ? ` (${res.milestones} milestones)` : ""}`);
+          location.hash = "#/boards";
+          route();
+        } finally { e.target.disabled = false; e.target.textContent = "Import"; }
+      }),
+    }, "Import"),
+  ]);
 }
 
 async function issuesPanel(el, opts = {}) {
@@ -554,8 +1022,18 @@ async function rocksPanel(el, opts = {}) {
   const q = new URLSearchParams({ quarter });
   if (teamId) q.set("team_id", teamId);
   if (ownerId) q.set("owner_id", ownerId);
-  const items = await api("GET", "rocks?" + q);
+  const [items, linked] = await Promise.all([api("GET", "rocks?" + q), api("GET", "todos" + (teamId ? "?team_id=" + teamId : ""))]);
   const reload = () => { el.innerHTML = ""; rocksPanel(el, { ...opts, quarter }); };
+  const progress = (r) => {
+    const mine = linked.filter((t) => t.rock_id === r.id);
+    const ms = mine.filter((t) => t.milestone), tasks = mine.filter((t) => !t.milestone);
+    if (!mine.length) return null;
+    const done = (xs) => xs.filter((t) => t.done).length;
+    return h("div", { class: "rprog" },
+      ms.length ? h("span", { class: "mtag" }, `◆ ${done(ms)}/${ms.length} milestones`) : null,
+      tasks.length ? h("span", { class: "tag" }, `${done(tasks)}/${tasks.length} tasks`) : null,
+      h("a", { href: "#/boards", onclick: () => { boardFilter.rock = String(r.id); } }, "View on board →"));
+  };
   const cycle = { on: "off", off: "done", done: "on" };
   const label = { on: "On track", off: "Off track", done: "Done" };
   const groups = new Map();
@@ -567,7 +1045,8 @@ async function rocksPanel(el, opts = {}) {
       list.append(h("li", { class: "rowi" + (r.status === "done" ? " done" : "") },
         avatars(ownersOf(r)),
         h("div", { class: "title", onclick: () => editRock(r, reload) }, h("div", { class: "t" }, r.title),
-          h("div", { class: "d" }, ownerNames(ownersOf(r)) + (teamId ? "" : " · " + teamName(r.team_id)) + (r.description && !meeting ? " — " + r.description : ""))),
+          h("div", { class: "d" }, ownerNames(ownersOf(r)) + (teamId ? "" : " · " + teamName(r.team_id)) + (r.description && !meeting ? " — " + r.description : "")),
+          progress(r)),
         h("span", { class: "meta" }, r.due_date ? "Due " + fmtDate(r.due_date) : ""),
         meeting && r.status === "off" ? h("button", { class: "btn small", onclick: () => safe(async () => { await api("POST", "issues", { title: "Rock off track: " + r.title, team_id: r.team_id, owner_ids: ownersOf(r) }); toast("Added to issues"); }) }, "→ Issue") : null,
         h("button", { class: "pill " + r.status, title: "Click to change status", onclick: () => safe(async () => { await api("PUT", "rocks/" + r.id, { status: cycle[r.status] }); reload(); }) }, label[r.status])));
@@ -1021,7 +1500,7 @@ async function pageMeeting(view, id) {
     } else if (key === "todos") {
       content.append(h("div", { class: "prompt" }, "Review last week's to-dos: done or not done. Check them off as you go."));
       const box = h("div"); content.append(box);
-      return todosPanel(box, { teamId: S.teamId, title: "Team to-dos" });
+      return todosPanel(box, { teamId: S.teamId, title: "Team to-dos", meeting: true });
     } else if (key === "ids") {
       content.append(h("div", { class: "prompt" }, h("b", {}, "Identify, Discuss, Solve. "), "Pick your top 3 issues (click the circle to rank them), then work them in order. Create to-dos as you solve."));
       const box = h("div"); content.append(box);
