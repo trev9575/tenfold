@@ -7,7 +7,7 @@ ENV PYTHONUNBUFFERED=1 \
     PGID=100
 
 WORKDIR /app
-COPY server.py ./
+COPY server.py calendar_feed.py ./
 COPY static ./static
 
 # The server starts as root only long enough to take ownership of /data,

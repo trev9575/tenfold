@@ -16,7 +16,8 @@ A small, self-hosted team tool for running your business on EOS®-style practice
 | **Issues** | Short- and long-term lists, top-3 ranking, solve, turn into to-dos |
 | **Headlines** | Customer and employee news, drop down to issues |
 | **Vision / Traction Organizer** | Core values, core focus, 10-year target, marketing strategy, 3-year picture, 1-year plan; pulls in current rocks and long-term issues. Autosaves |
-| **Accountability Chart** | Org chart of seats, the person in each seat, and their roles |
+| **Accountability Chart** | Org chart of seats, the people in each seat, and their roles |
+| **Availability** | Weekly team calendar from everyone's Google Calendar, showing busy blocks per person and highlighting times when everyone is free. Teammates see only busy/free, never event titles |
 | **Teams and people** | Multiple teams, invite-link sign-up, admin-managed accounts, password changes |
 
 | Meeting runner | Accountability chart | Scorecard |
@@ -139,6 +140,15 @@ docker run -d --name tenfold --restart unless-stopped \
 3. Add more teams under **Settings → Teams** if you need them. Switch teams with the dropdown at the top left.
 4. A suggested order for setting things up: **Accountability Chart → V/TO → Rocks → Scorecard**, then run your first **Level 10 Meeting**.
 
+## Connecting Google Calendar (Availability page)
+
+Each person connects their own calendar from the **Availability** page:
+1. Open [Google Calendar settings](https://calendar.google.com/calendar/r/settings) on a computer.
+2. Under **Settings for my calendars**, click your calendar and choose **Integrate calendar**.
+3. Copy the **Secret address in iCal format** and paste it into Tenfold.
+
+Tenfold reads the calendar every few minutes and shows only busy/free times to the team. The secret address is stored on your server and is never shown to other users. The container needs outbound internet access to reach Google, which Unraid allows by default. Any calendar app that offers an iCal (.ics) link works too, such as Outlook or iCloud.
+
 ## Letting friends in from outside your house
 
 Don't forward port 8090 straight to the internet. Two good options:
@@ -165,7 +175,7 @@ Everything is stored in one file, `/mnt/user/appdata/tenfold/tenfold.db` (plus `
 | `PUID` / `PGID` | `99` / `100` | User and group that own the data. Unraid's `nobody:users` |
 | `COOKIE_SECURE` | `false` | Set to `true` when served over HTTPS |
 | `SESSION_DAYS` | `30` | How long a sign-in lasts |
-| `TZ` | (none) | Container time zone |
+| `TZ` | (none) | Container time zone. The Availability page always uses each viewer's own browser time zone |
 
 ## Running locally (development)
 
@@ -178,7 +188,7 @@ python3 server.py
 ## Troubleshooting
 
 - **"pull access denied" or "unauthorized" when installing:** the GHCR package is still private (see Part 1, step 4), or the username in the repository field isn't all lowercase.
-- **The page won't load:** check the container log (Docker tab → Tenfold icon → *Logs*). It should say `Tenfold 1.1.0 running on http://0.0.0.0:8090`. Make sure the host port isn't used by another container.
+- **The page won't load:** check the container log (Docker tab → Tenfold icon → *Logs*). It should say `Tenfold 1.3.0 running on http://0.0.0.0:8090`. Make sure the host port isn't used by another container.
 - **You keep getting signed out over plain HTTP:** make sure `COOKIE_SECURE` is `false` unless you're using HTTPS.
 - **Forgot the admin password:** another admin can reset it under Settings → People. If you were the only admin, stop the container, delete `tenfold.db`, and start over (this erases everything), or ask for help resetting it with `sqlite3`.
 

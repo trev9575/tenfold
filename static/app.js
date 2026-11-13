@@ -184,6 +184,7 @@ const NAV = [
   ["#/todos", "✓", "To-Dos"],
   ["#/issues", "!", "Issues"],
   ["#/headlines", "❝", "Headlines"],
+  ["#/availability", "▥", "Availability"],
   ["sep"],
   ["#/vto", "◎", "Vision / Traction"],
   ["#/chart", "⑂", "Accountability Chart"],
@@ -210,7 +211,7 @@ async function logout() { await safe(() => api("POST", "logout")); S.me = null; 
 
 const ROUTES = {
   home: pageHome, meetings: pageMeetings, meeting: pageMeeting, scorecard: pageScorecard, rocks: pageRocks,
-  todos: pageTodos, issues: pageIssues, headlines: pageHeadlines, vto: pageVto, chart: pageChart, settings: pageSettings,
+  todos: pageTodos, issues: pageIssues, availability: pageAvailability, headlines: pageHeadlines, vto: pageVto, chart: pageChart, settings: pageSettings,
 };
 
 async function route() {
@@ -980,6 +981,153 @@ async function pageMeeting(view, id) {
   tick();
   S.timers.push(setInterval(tick, 1000));
 }
+
+// ---- availability (Google Calendar via secret iCal link)
+const HOUR_PX = 44;
+const HOUR_RANGES = { work: [8, 18, "Work hours"], day: [7, 22, "7am–10pm"], all: [0, 24, "24 hours"] };
+
+function calendarConnectCard(onDone) {
+  const connected = S.me.has_calendar;
+  const input = h("input", { class: "input", placeholder: "https://calendar.google.com/calendar/ical/…/basic.ics", "aria-label": "Secret iCal address" });
+  const save = h("button", { class: "btn primary", onclick: () => safe(async () => {
+    if (!input.value.trim()) { toast("Paste your secret iCal address first", true); return; }
+    save.disabled = true; save.textContent = "Checking…";
+    try { await api("PUT", "me/calendar", { url: input.value.trim() }); } finally { save.disabled = false; save.textContent = "Connect"; }
+    S.me.has_calendar = true; toast("Calendar connected"); onDone();
+  }) }, "Connect");
+  const steps = h("ol", { class: "steps" },
+    h("li", {}, "Open ", h("a", { href: "https://calendar.google.com/calendar/r/settings", target: "_blank", rel: "noopener" }, "Google Calendar settings"), " on a computer."),
+    h("li", {}, "On the left under ", h("b", {}, "Settings for my calendars"), ", click your calendar, then ", h("b", {}, "Integrate calendar"), "."),
+    h("li", {}, "Copy the ", h("b", {}, "Secret address in iCal format"), " and paste it below."));
+  const form = h("div", {}, steps, h("div", { style: { display: "flex", gap: "8px" } }, input, save),
+    h("p", { class: "hint" }, "Teammates only see when you're busy, never event titles or details. Changes in Google can take a few minutes to show up here."));
+  if (!connected) return h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Connect your Google Calendar")), h("div", { class: "card-body" }, form));
+  const body = h("div", { class: "card-body", style: { display: "none" } }, form);
+  return h("div", { class: "card" }, h("div", { class: "card-head" },
+    h("span", { class: "pill on" }, "✓ Your Google Calendar is connected"), h("span", { class: "spacer" }),
+    h("button", { class: "btn small", onclick: () => { body.style.display = body.style.display ? "" : "none"; } }, "Replace link"),
+    h("button", { class: "btn small danger", onclick: () => { if (confirm("Disconnect your calendar?")) safe(async () => { await api("PUT", "me/calendar", { url: "" }); S.me.has_calendar = false; onDone(); }); } }, "Disconnect")), body);
+}
+
+async function pageAvailability(view) {
+  let weekOffset = Number(store.get("tf_av_week_off") || 0);
+  if (Math.abs(weekOffset) > 8) weekOffset = 0;
+  const rangeKey = HOUR_RANGES[store.get("tf_av_hours")] ? store.get("tf_av_hours") : "day";
+  const [h0, h1] = HOUR_RANGES[rangeKey];
+  const mon = parseYmd(weekStart());
+  mon.setDate(mon.getDate() + 7 * weekOffset);
+  const days = [...Array(7)].map((_, i) => { const d = new Date(mon); d.setDate(d.getDate() + i); return d; });
+  const start = new Date(mon), end = new Date(mon); end.setDate(end.getDate() + 7);
+  const tzName = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const go = (off) => { store.set("tf_av_week_off", String(off)); route(); };
+
+  view.append(pageHead("Availability", `When your team is busy or free · times shown in ${tzName}`,
+    h("div", { class: "seg" }, Object.entries(HOUR_RANGES).map(([k, [, , label]]) => h("button", { class: k === rangeKey ? "on" : "", onclick: () => { store.set("tf_av_hours", k); route(); } }, label))),
+    h("a", { class: "btn", href: "https://calendar.google.com", target: "_blank", rel: "noopener" }, "Open Google Calendar ↗")));
+  view.append(calendarConnectCard(() => route()));
+
+  const status = h("span", { class: "meta" }, "Loading calendars…");
+  const chipsRow = h("div", { class: "chips" });
+  const grid = h("div", { class: "cal-wrap" });
+  const label = `${days[0].toLocaleDateString(undefined, { month: "short", day: "numeric" })} – ${days[6].toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}`;
+  view.append(h("div", { class: "card mt" },
+    h("div", { class: "card-head" },
+      h("button", { class: "btn small", onclick: () => go(weekOffset - 1), "aria-label": "Previous week" }, "‹"),
+      h("button", { class: "btn small", onclick: () => go(0) }, "This week"),
+      h("button", { class: "btn small", onclick: () => go(weekOffset + 1), "aria-label": "Next week" }, "›"),
+      h("h2", {}, label), h("span", { class: "spacer" }),
+      h("span", { class: "legend" }, h("i", { class: "free-sw" }), "Everyone selected is free"), status),
+    h("div", { class: "card-body", style: { paddingBottom: "8px" } }, chipsRow), grid));
+
+  let data;
+  try { data = await api("GET", `availability?start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}`); }
+  catch (e) { status.textContent = ""; throw e; }
+  const byUser = new Map(data.map((d) => [d.user_id, d]));
+  const connected = S.users.filter((u) => byUser.has(u.id));
+  status.textContent = connected.length ? "" : "";
+  let hidden;
+  try { hidden = new Set(JSON.parse(store.get("tf_av_hidden") || "[]")); } catch (e) { hidden = new Set(); }
+
+  // people chips
+  for (const u of S.users) {
+    const d = byUser.get(u.id);
+    if (!d) { chipsRow.append(h("span", { class: "chip off", title: "Hasn't connected a calendar yet" }, avatar(u.id), h("span", {}, u.name), h("small", {}, "not connected"))); continue; }
+    const cb = h("input", { type: "checkbox", checked: !hidden.has(u.id), onchange: () => {
+      if (cb.checked) hidden.delete(u.id); else hidden.add(u.id);
+      store.set("tf_av_hidden", JSON.stringify([...hidden])); draw();
+    } });
+    chipsRow.append(h("label", { class: "chip", title: d.error || "" }, cb, avatar(u.id), h("span", {}, u.name), d.error ? h("small", { class: "warn-t" }, "⚠ error") : null));
+  }
+  const errs = data.filter((d) => d.error);
+  if (errs.length) chipsRow.append(h("div", { class: "hint", style: { width: "100%" } }, errs.map((d) => `${userName(d.user_id)}: ${d.error}`).join(" · ")));
+  if (!connected.length) {
+    grid.append(h("div", { class: "empty" }, "No one has connected a calendar yet. Connect yours above, then ask your team to do the same."));
+    return;
+  }
+
+  function draw() {
+    grid.innerHTML = "";
+    const people = connected.filter((u) => !hidden.has(u.id) && !byUser.get(u.id).error);
+    const busyOf = (uid) => byUser.get(uid).busy.map(([a, b]) => [new Date(a), new Date(b)]);
+    const busy = new Map(people.map((u) => [u.id, busyOf(u.id)]));
+    const now = new Date();
+    const cal = h("div", { class: "cal", style: { gridTemplateColumns: `52px repeat(7, minmax(110px, 1fr))` } });
+    cal.append(h("div", { class: "cal-corner" }));
+    for (const d of days) {
+      const ds = ymd(d);
+      const away = people.filter((u) => byUser.get(u.id).allday.includes(ds));
+      cal.append(h("div", { class: "cal-dayhead" + (ds === today() ? " today" : "") },
+        h("div", { class: "dn" }, d.toLocaleDateString(undefined, { weekday: "short" })), h("div", { class: "dd" }, d.getDate()),
+        away.length ? h("div", { class: "away", title: away.map((u) => u.name).join(", ") + " · all-day event" }, "All day: ", avatars(away.map((u) => u.id))) : null));
+    }
+    const times = h("div", { class: "cal-times", style: { height: (h1 - h0) * HOUR_PX + "px" } });
+    for (let hr = h0; hr < h1; hr++) {
+      const t = new Date(2000, 0, 1, hr);
+      times.append(h("div", { class: "cal-hr", style: { top: (hr - h0) * HOUR_PX + "px" } }, t.toLocaleTimeString(undefined, { hour: "numeric" })));
+    }
+    cal.append(times);
+    const lanes = Math.max(1, people.length);
+    for (const d of days) {
+      const col = h("div", { class: "cal-col", style: { height: (h1 - h0) * HOUR_PX + "px", backgroundSize: `100% ${HOUR_PX}px` } });
+      const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate(), h0);
+      const dayEnd = new Date(d.getFullYear(), d.getMonth(), d.getDate(), h1 === 24 ? 23 : h1, h1 === 24 ? 59 : 0, h1 === 24 ? 59 : 0);
+      const y = (t) => ((t - dayStart) / 3600000) * HOUR_PX;
+      // past shading
+      if (now > dayStart) col.append(h("div", { class: "cal-past", style: { top: 0, height: Math.min(y(now), (h1 - h0) * HOUR_PX) + "px" } }));
+      // everyone-free slots (30 min)
+      if (people.length) {
+        let runStart = null;
+        const flush = (t) => { if (runStart) { col.append(h("div", { class: "cal-free", style: { top: y(runStart) + "px", height: y(t) - y(runStart) + "px" }, title: `Everyone free ${fmtTime(runStart)}–${fmtTime(t)}` })); runStart = null; } };
+        for (let t = new Date(dayStart); t < dayEnd; t = new Date(t.getTime() + 30 * 60000)) {
+          const t2 = new Date(Math.min(t.getTime() + 30 * 60000, dayEnd.getTime()));
+          const free = people.every((u) => !busy.get(u.id).some(([a, b]) => a < t2 && b > t));
+          if (free && !runStart) runStart = t;
+          if (!free) flush(t);
+        }
+        flush(dayEnd);
+      }
+      // busy blocks per person lane
+      people.forEach((u, i) => {
+        for (const [a, b] of busy.get(u.id)) {
+          const s = a < dayStart ? dayStart : a, e = b > dayEnd ? dayEnd : b;
+          if (e <= s) continue;
+          col.append(h("div", {
+            class: "cal-busy", title: `${u.name}: busy ${fmtTime(a)}–${fmtTime(b)}`,
+            style: { top: y(s) + "px", height: Math.max(4, y(e) - y(s)) + "px", left: `calc(${(100 / lanes) * i}% + 2px)`, width: `calc(${100 / lanes}% - 4px)`, background: COLORS[u.id % COLORS.length] },
+          }, y(e) - y(s) >= 18 && lanes <= 4 ? initials(u.name) : ""));
+        }
+      });
+      if (ymd(d) === today() && now >= dayStart && now <= dayEnd) col.append(h("div", { class: "cal-now", style: { top: y(now) + "px" } }));
+      cal.append(col);
+    }
+    grid.append(cal);
+    const sc = grid;
+    const nowRow = (now.getHours() - h0 - 1) * HOUR_PX;
+    if (weekOffset === 0 && nowRow > 0) sc.scrollTop = nowRow;
+  }
+  draw();
+}
+const fmtTime = (d) => d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
 
 // ---- settings / admin
 async function pageSettings(view) {

@@ -15,10 +15,13 @@ import sqlite3
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+import calendar_feed
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(BASE_DIR, "data"))
@@ -29,7 +32,7 @@ PORT = int(os.environ.get("PORT", "8090"))
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
 SESSION_DAYS = int(os.environ.get("SESSION_DAYS", "30"))
 COOKIE_NAME = "tf_session"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -215,6 +218,9 @@ def init_db():
     conn = db()
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    user_cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+    if "ical_url" not in user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN ical_url TEXT")
     # Migration: add multi-owner columns to databases created by older versions.
     for table, (single, multi) in MULTI_OWNER.items():
         existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -260,7 +266,9 @@ def row(r):
 
 
 def public_user(u):
-    return {k: u[k] for k in ("id", "name", "email", "is_admin", "created_at")}
+    d = {k: u[k] for k in ("id", "name", "email", "is_admin", "created_at")}
+    d["has_calendar"] = bool(u["ical_url"]) if "ical_url" in u.keys() else False
+    return d
 
 
 class ApiError(Exception):
@@ -479,6 +487,12 @@ class Handler(BaseHTTPRequestHandler):
             self.set_session_cookie("", 0)
             return {"ok": True}
 
+        if head == "me" and len(parts) > 1 and parts[1] == "calendar" and method == "PUT":
+            return self.set_calendar(conn, body)
+
+        if head == "availability" and method == "GET":
+            return self.availability(conn)
+
         if head == "me":
             if method == "GET":
                 return public_user(user)
@@ -536,6 +550,59 @@ class Handler(BaseHTTPRequestHandler):
             conn.execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_password(body["new_password"]), u["id"]))
             conn.execute("DELETE FROM sessions WHERE user_id=? AND token<>?", (u["id"], self.token))
         return public_user(conn.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone())
+
+    def set_calendar(self, conn, body):
+        url = str(body.get("url") or "").strip()
+        old = self.user["ical_url"]
+        if old:
+            calendar_feed.forget(old)
+        if not url:
+            conn.execute("UPDATE users SET ical_url=NULL WHERE id=?", (self.user["id"],))
+            return {"ok": True, "has_calendar": False}
+        try:
+            url = calendar_feed.normalize_url(url)
+            text = calendar_feed.fetch(url, use_cache=False)
+            now = datetime.now(timezone.utc)
+            calendar_feed.busy_blocks(text, now, now + timedelta(days=7))
+        except calendar_feed.FeedError as e:
+            raise ApiError(400, str(e))
+        except Exception:
+            traceback.print_exc()
+            raise ApiError(400, "Downloaded the calendar but couldn't read it.")
+        conn.execute("UPDATE users SET ical_url=? WHERE id=?", (url, self.user["id"]))
+        return {"ok": True, "has_calendar": True}
+
+    def availability(self, conn):
+        def parse(q, default):
+            v = self.query.get(q)
+            if not v:
+                return default
+            try:
+                return datetime.fromisoformat(v.replace("Z", "+00:00")).astimezone(timezone.utc)
+            except ValueError:
+                raise ApiError(400, f"Invalid {q}")
+        start = parse("start", datetime.now(timezone.utc))
+        end = parse("end", start + timedelta(days=7))
+        if end <= start or end - start > timedelta(days=45):
+            raise ApiError(400, "Range must be between 0 and 45 days")
+        users = conn.execute("SELECT id, ical_url FROM users WHERE ical_url IS NOT NULL AND ical_url <> ''").fetchall()
+
+        def one(u):
+            out = {"user_id": u["id"], "busy": [], "allday": [], "error": None}
+            try:
+                res = calendar_feed.busy_blocks(calendar_feed.fetch(u["ical_url"]), start, end)
+                iso = lambda d: d.strftime("%Y-%m-%dT%H:%M:%SZ")
+                out["busy"] = [[iso(s), iso(e)] for s, e in res["busy"]]
+                out["allday"] = [d.isoformat() for d in res["allday"]]
+            except calendar_feed.FeedError as e:
+                out["error"] = str(e)
+            except Exception:
+                traceback.print_exc()
+                out["error"] = "Couldn't read this calendar."
+            return out
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            return list(pool.map(one, users))
 
     def require_admin(self):
         if not self.user["is_admin"]:
