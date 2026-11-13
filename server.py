@@ -29,7 +29,7 @@ PORT = int(os.environ.get("PORT", "8090"))
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
 SESSION_DAYS = int(os.environ.get("SESSION_DAYS", "30"))
 COOKIE_NAME = "tf_session"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -178,6 +178,27 @@ RESOURCES = {
 }
 
 
+# Resources that can have several owners. The first owner is also kept in the
+# single-owner column so sorting and older data keep working.
+MULTI_OWNER = {
+    "rocks": ("owner_id", "owner_ids"),
+    "issues": ("owner_id", "owner_ids"),
+    "headlines": ("owner_id", "owner_ids"),
+    "measurables": ("owner_id", "owner_ids"),
+    "seats": ("user_id", "user_ids"),
+}
+
+
+def encode_ids(ids):
+    return "," + ",".join(str(i) for i in ids) + "," if ids else None
+
+
+def decode_ids(text, fallback):
+    if text:
+        return [int(x) for x in text.strip(",").split(",") if x.strip().isdigit()]
+    return [fallback] if fallback else []
+
+
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -194,6 +215,12 @@ def init_db():
     conn = db()
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    # Migration: add multi-owner columns to databases created by older versions.
+    for table, (single, multi) in MULTI_OWNER.items():
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if multi not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {multi} TEXT")
+            conn.execute(f"UPDATE {table} SET {multi} = ',' || {single} || ',' WHERE {single} IS NOT NULL")
     conn.execute("DELETE FROM sessions WHERE expires_at < ?", (time.time(),))
     conn.commit()
     conn.close()
@@ -547,11 +574,25 @@ class Handler(BaseHTTPRequestHandler):
             if uid == self.user["id"]:
                 raise ApiError(400, "You can't delete yourself")
             conn.execute("DELETE FROM users WHERE id=?", (uid,))
+            for table, (single, multi) in MULTI_OWNER.items():
+                tag = f",{uid},"
+                for r in conn.execute(f"SELECT id, {multi} FROM {table} WHERE {multi} LIKE ?", (f"%{tag}%",)).fetchall():
+                    ids = [i for i in decode_ids(r[multi], None) if i != uid]
+                    conn.execute(f"UPDATE {table} SET {multi}=?, {single}=? WHERE id=?",
+                                 (encode_ids(ids), ids[0] if ids else None, r["id"]))
             return {"ok": True}
         raise ApiError(405, "Method not allowed")
 
+    def out(self, name, r):
+        d = row(r)
+        if d is not None and name in MULTI_OWNER:
+            single, multi = MULTI_OWNER[name]
+            d[multi] = decode_ids(d.get(multi), d.get(single))
+        return d
+
     def crud(self, conn, method, name, ident, body):
         spec = RESOURCES[name]
+        multi = MULTI_OWNER.get(name)
         cols = spec["cols"]
         if ident is not None and not ident.isdigit():
             raise ApiError(404, "Not found")
@@ -562,10 +603,13 @@ class Handler(BaseHTTPRequestHandler):
                 r = conn.execute(f"SELECT * FROM {name} WHERE id=?", (rid,)).fetchone()
                 if not r:
                     raise ApiError(404, "Not found")
-                return row(r)
+                return self.out(name, r)
             where, args = [], []
             for k, v in self.query.items():
-                if k in cols or k == "id":
+                if multi and k == multi[0]:  # "owned by X" matches any of the owners
+                    where.append(f"({multi[0]} = ? OR {multi[1]} LIKE ?)")
+                    args += [v, f"%,{v},%"]
+                elif k in cols or k == "id":
                     where.append(f"{k} = ?")
                     args.append(v)
             if "since" in self.query and name == "todos":
@@ -575,7 +619,7 @@ class Handler(BaseHTTPRequestHandler):
             if where:
                 sql += " WHERE " + " AND ".join(where)
             sql += f" ORDER BY {spec['order']}"
-            return [row(r) for r in conn.execute(sql, args)]
+            return [self.out(name, r) for r in conn.execute(sql, args)]
 
         if spec.get("admin_write"):
             self.require_admin()
@@ -588,6 +632,19 @@ class Handler(BaseHTTPRequestHandler):
                 if ch and val is not None and val not in ch:
                     raise ApiError(400, f"{k} must be one of {', '.join(ch)}")
                 values[k] = val
+        if multi and multi[1] in body:
+            raw = body[multi[1]] or []
+            if not isinstance(raw, list):
+                raise ApiError(400, f"{multi[1]} must be a list")
+            ids = []
+            for x in raw:
+                i = coerce(int, x, multi[1])
+                if i and i not in ids:
+                    ids.append(i)
+            values[multi[1]] = encode_ids(ids)
+            values[multi[0]] = ids[0] if ids else None
+        elif multi and multi[0] in values:
+            values[multi[1]] = encode_ids([values[multi[0]]] if values[multi[0]] else [])
 
         required = spec.get("required", "title")
         if method == "POST":
@@ -604,7 +661,7 @@ class Handler(BaseHTTPRequestHandler):
             cur = conn.execute(
                 f"INSERT INTO {name}({','.join(keys)}) VALUES ({','.join('?' * len(keys))})",
                 [values[k] for k in keys])
-            return row(conn.execute(f"SELECT * FROM {name} WHERE id=?", (cur.lastrowid,)).fetchone())
+            return self.out(name, conn.execute(f"SELECT * FROM {name} WHERE id=?", (cur.lastrowid,)).fetchone())
 
         if rid is None:
             raise ApiError(404, "Not found")
@@ -624,7 +681,7 @@ class Handler(BaseHTTPRequestHandler):
             if values:
                 sets = ", ".join(f"{k}=?" for k in values)
                 conn.execute(f"UPDATE {name} SET {sets} WHERE id=?", [*values.values(), rid])
-            return row(conn.execute(f"SELECT * FROM {name} WHERE id=?", (rid,)).fetchone())
+            return self.out(name, conn.execute(f"SELECT * FROM {name} WHERE id=?", (rid,)).fetchone())
 
         if method == "DELETE":
             if name == "seats":  # children move up to the deleted seat's parent

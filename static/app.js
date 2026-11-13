@@ -78,6 +78,19 @@ function avatar(id, big) {
   if (!u) return h("span", { class: "av none" + (big ? " lg" : ""), title: "Unassigned" }, "?");
   return h("span", { class: "av" + (big ? " lg" : ""), title: u.name, style: { background: COLORS[u.id % COLORS.length] } }, initials(u.name));
 }
+// Owners: items can have several owners (owner_ids); older items only have owner_id.
+function ownersOf(x, single = "owner_id", multi = "owner_ids") {
+  const ids = x && x[multi] && x[multi].length ? x[multi] : x && x[single] ? [x[single]] : [];
+  return ids.map(Number).filter((id) => userById(id));
+}
+function avatars(ids) {
+  if (!ids.length) return avatar(null);
+  const shown = ids.slice(0, 4);
+  return h("span", { class: "avs", title: ids.map(userName).join(", ") }, shown.map((id) => avatar(id)),
+    ids.length > 4 ? h("span", { class: "av more" }, "+" + (ids.length - 4)) : null);
+}
+const ownerNames = (ids) => ids.length ? ids.map(userName).join(", ") : "Unassigned";
+const idList = (v) => (v || []).map(Number);
 const teamName = (id) => (S.teams.find((t) => t.id === id) || {}).name || "";
 const userOptions = (blank = true) => [...(blank ? [["", "Unassigned"]] : []), ...S.users.map((u) => [u.id, u.name])];
 
@@ -331,9 +344,10 @@ async function todosPanel(el, opts = {}) {
     list, S.teamId ? h("div", { class: "quick-add" }, qa) : null));
 }
 
-const ownersField = (ids) => ({ name: "owner_ids", label: "Owners", type: "multiselect", avatars: true, required: true,
+const ownersField = (ids, opts = {}) => ({
+  name: opts.name || "owner_ids", label: opts.label || "Owners", type: "multiselect", avatars: true, required: opts.required !== false,
   options: S.users.map((u) => [u.id, u.name]), value: ids.filter(Boolean),
-  hint: "Pick more than one and everyone gets their own copy to check off." });
+  hint: opts.hint === undefined ? "Pick more than one and everyone gets their own copy to check off." : opts.hint });
 
 async function createTodosForOwners(v, extra = {}) {
   const { owner_ids, ...rest } = v;
@@ -347,11 +361,21 @@ function editTodo(t, done) {
     fields: [
       { name: "title", label: "Title", value: t.title, required: true },
       { name: "description", label: "Details", type: "textarea", value: t.description, rows: 3 },
-      t.id ? { name: "owner_id", label: "Owner", type: "select", options: userOptions(), value: t.owner_id, half: true } : ownersField([t.owner_id]),
-      { name: "due_date", label: "Due", type: "date", value: t.due_date, half: !!t.id },
+      ownersField([t.owner_id], t.id ? { hint: "Adding people gives each of them their own copy of this to-do." } : {}),
+      { name: "due_date", label: "Due", type: "date", value: t.due_date },
       { name: "team_id", label: "Team", type: "select", options: S.teams.map((x) => [x.id, x.name]), value: t.team_id },
     ],
-    onSubmit: async (v) => { if (t.id) await api("PUT", "todos/" + t.id, v); else await createTodosForOwners(v); done(); },
+    onSubmit: async (v) => {
+      if (!t.id) { await createTodosForOwners(v); done(); return; }
+      const { owner_ids, ...rest } = v;
+      const ids = idList(owner_ids);
+      const keep = ids.includes(t.owner_id) ? t.owner_id : ids[0];
+      await api("PUT", "todos/" + t.id, { ...rest, owner_id: keep });
+      const others = ids.filter((x) => x !== keep);
+      for (const o of others) await api("POST", "todos", { ...rest, owner_id: o, issue_id: t.issue_id });
+      if (others.length) toast(`Added a copy for ${others.length} more ${others.length === 1 ? "person" : "people"}`);
+      done();
+    },
     onDelete: t.id ? async () => { await api("DELETE", "todos/" + t.id); done(); } : null,
   });
 }
@@ -379,7 +403,7 @@ async function issuesPanel(el, opts = {}) {
       }, i.priority || ""),
       h("div", { class: "title", onclick: () => editIssue(i, reload) }, h("div", { class: "t" }, i.title), i.description ? h("div", { class: "d" }, i.description) : null),
       h("span", { class: "meta" }, fmtDate(i.created_at)),
-      avatar(i.owner_id),
+      avatars(ownersOf(i)),
       meeting && !solved ? h("button", { class: "btn small", onclick: () => issueToTodo(i, reload) }, "+ To-Do") : null,
       h("button", {
         class: "btn small" + (solved ? "" : " primary"),
@@ -405,11 +429,11 @@ function editIssue(i, done) {
     fields: [
       { name: "title", label: "Issue", value: i.title, required: true },
       { name: "description", label: "Details", type: "textarea", value: i.description },
-      { name: "owner_id", label: "Owner", type: "select", options: userOptions(), value: i.owner_id, half: true },
-      { name: "term", label: "List", type: "select", options: [["short", "Short-term"], ["long", "Long-term"]], value: i.term || "short", half: true },
+      ownersField(ownersOf(i), { required: false, hint: "Everyone picked shares this item." }),
+      { name: "term", label: "List", type: "select", options: [["short", "Short-term"], ["long", "Long-term"]], value: i.term || "short" },
       { name: "team_id", label: "Team", type: "select", options: S.teams.map((x) => [x.id, x.name]), value: i.team_id },
     ],
-    onSubmit: async (v) => { await api(i.id ? "PUT" : "POST", "issues" + (i.id ? "/" + i.id : ""), v); done(); },
+    onSubmit: async (v) => { await api(i.id ? "PUT" : "POST", "issues" + (i.id ? "/" + i.id : ""), { ...v, owner_ids: idList(v.owner_ids) }); done(); },
     onDelete: i.id ? async () => { await api("DELETE", "issues/" + i.id); done(); } : null,
   });
 }
@@ -419,7 +443,7 @@ function issueToTodo(i, done) {
     title: "To-do from issue",
     fields: [
       { name: "title", label: "To-do", value: "", required: true, placeholder: "What needs to happen?" },
-      ownersField([i.owner_id || S.me.id]),
+      ownersField(ownersOf(i).length ? ownersOf(i) : [S.me.id]),
       { name: "due_date", label: "Due", type: "date", value: addDays(today(), 7) },
     ],
     submitLabel: "Create to-do",
@@ -444,11 +468,11 @@ async function rocksPanel(el, opts = {}) {
   for (const [owner, rocks] of groups) {
     for (const r of rocks) {
       list.append(h("li", { class: "rowi" + (r.status === "done" ? " done" : "") },
-        avatar(r.owner_id),
+        avatars(ownersOf(r)),
         h("div", { class: "title", onclick: () => editRock(r, reload) }, h("div", { class: "t" }, r.title),
-          h("div", { class: "d" }, userName(r.owner_id) + (teamId ? "" : " · " + teamName(r.team_id)) + (r.description && !meeting ? " — " + r.description : ""))),
+          h("div", { class: "d" }, ownerNames(ownersOf(r)) + (teamId ? "" : " · " + teamName(r.team_id)) + (r.description && !meeting ? " — " + r.description : ""))),
         h("span", { class: "meta" }, r.due_date ? "Due " + fmtDate(r.due_date) : ""),
-        meeting && r.status === "off" ? h("button", { class: "btn small", onclick: () => safe(async () => { await api("POST", "issues", { title: "Rock off track: " + r.title, team_id: r.team_id, owner_id: r.owner_id }); toast("Added to issues"); }) }, "→ Issue") : null,
+        meeting && r.status === "off" ? h("button", { class: "btn small", onclick: () => safe(async () => { await api("POST", "issues", { title: "Rock off track: " + r.title, team_id: r.team_id, owner_ids: ownersOf(r) }); toast("Added to issues"); }) }, "→ Issue") : null,
         h("button", { class: "pill " + r.status, title: "Click to change status", onclick: () => safe(async () => { await api("PUT", "rocks/" + r.id, { status: cycle[r.status] }); reload(); }) }, label[r.status])));
     }
   }
@@ -469,13 +493,13 @@ function editRock(r, done) {
     fields: [
       { name: "title", label: "Rock", value: r.title, required: true, placeholder: "Specific, measurable, done by end of quarter" },
       { name: "description", label: "Details / milestones", type: "textarea", value: r.description },
-      { name: "owner_id", label: "Owner", type: "select", options: userOptions(), value: r.owner_id, half: true },
-      { name: "status", label: "Status", type: "select", options: [["on", "On track"], ["off", "Off track"], ["done", "Done"]], value: r.status, half: true },
+      ownersField(ownersOf(r), { required: false, hint: "Everyone picked shares this item." }),
+      { name: "status", label: "Status", type: "select", options: [["on", "On track"], ["off", "Off track"], ["done", "Done"]], value: r.status },
       { name: "quarter", label: "Quarter", value: r.quarter, half: true, placeholder: "2026-Q4" },
       { name: "due_date", label: "Due", type: "date", value: r.due_date, half: true },
       { name: "team_id", label: "Team", type: "select", options: S.teams.map((x) => [x.id, x.name]), value: r.team_id },
     ],
-    onSubmit: async (v) => { await api(r.id ? "PUT" : "POST", "rocks" + (r.id ? "/" + r.id : ""), v); done(); },
+    onSubmit: async (v) => { await api(r.id ? "PUT" : "POST", "rocks" + (r.id ? "/" + r.id : ""), { ...v, owner_ids: idList(v.owner_ids) }); done(); },
     onDelete: r.id ? async () => { await api("DELETE", "rocks/" + r.id); done(); } : null,
   });
 }
@@ -491,11 +515,11 @@ async function headlinesPanel(el, opts = {}) {
   if (!items.length) list.append(h("li", { class: "empty" }, "No headlines. Share good news and quick updates about customers and people."));
   for (const x of items) {
     list.append(h("li", { class: "rowi" + (x.archived ? " done" : "") },
-      avatar(x.owner_id),
+      avatars(ownersOf(x)),
       h("div", { class: "title", onclick: () => editHeadline(x, reload) }, h("div", { class: "t" }, x.title)),
       h("span", { class: "pill neutral" }, kinds[x.kind]),
       h("span", { class: "meta" }, fmtDate(x.created_at)),
-      h("button", { class: "btn small", title: "Drop down to the issues list", onclick: () => safe(async () => { await api("POST", "issues", { title: x.title, team_id: x.team_id, owner_id: x.owner_id }); await api("PUT", "headlines/" + x.id, { archived: 1 }); toast("Moved to issues"); reload(); }) }, "→ Issue"),
+      h("button", { class: "btn small", title: "Drop down to the issues list", onclick: () => safe(async () => { await api("POST", "issues", { title: x.title, team_id: x.team_id, owner_ids: ownersOf(x) }); await api("PUT", "headlines/" + x.id, { archived: 1 }); toast("Moved to issues"); reload(); }) }, "→ Issue"),
       h("button", { class: "btn small", onclick: () => safe(async () => { await api("PUT", "headlines/" + x.id, { archived: x.archived ? 0 : 1 }); reload(); }) }, x.archived ? "Restore" : "Archive")));
   }
   el.append(h("div", { class: "card" },
@@ -510,10 +534,10 @@ function editHeadline(x, done) {
     title: x.id ? "Edit headline" : "New headline",
     fields: [
       { name: "title", label: "Headline", value: x.title, required: true, type: "textarea", rows: 2 },
-      { name: "kind", label: "Type", type: "select", options: [["general", "General"], ["customer", "Customer"], ["employee", "Employee"]], value: x.kind, half: true },
-      { name: "owner_id", label: "Owner", type: "select", options: userOptions(), value: x.owner_id, half: true },
+      { name: "kind", label: "Type", type: "select", options: [["general", "General"], ["customer", "Customer"], ["employee", "Employee"]], value: x.kind },
+      ownersField(ownersOf(x), { required: false, hint: "Everyone picked shares this item." }),
     ],
-    onSubmit: async (v) => { await api(x.id ? "PUT" : "POST", "headlines" + (x.id ? "/" + x.id : ""), { ...v, team_id: x.team_id }); done(); },
+    onSubmit: async (v) => { await api(x.id ? "PUT" : "POST", "headlines" + (x.id ? "/" + x.id : ""), { ...v, owner_ids: idList(v.owner_ids), team_id: x.team_id }); done(); },
     onDelete: x.id ? async () => { await api("DELETE", "headlines/" + x.id); done(); } : null,
   });
 }
@@ -552,7 +576,7 @@ async function scorecardPanel(el, opts = {}) {
     const avgCell = h("td", { class: "goal" }, avgOf() == null ? "" : fmtNum(avgOf(), m.unit));
     tb.append(h("tr", {},
       h("td", { class: "name", onclick: () => editMeasurable(m, reload) }, m.title),
-      h("td", {}, avatar(m.owner_id)),
+      h("td", {}, avatars(ownersOf(m))),
       h("td", { class: "goal" }, m.goal != null ? `${({ ">=": "≥", "<=": "≤" })[m.op] || m.op} ${fmtNum(m.goal, m.unit)}` : "—"),
       weeks.map((w) => {
         const v = val.get(m.id + "|" + w);
@@ -589,13 +613,13 @@ function editMeasurable(m, done) {
     title: m.id ? "Edit measurable" : "New measurable",
     fields: [
       { name: "title", label: "Measurable", value: m.title, required: true, placeholder: "e.g. Sales calls made" },
-      { name: "owner_id", label: "Owner", type: "select", options: userOptions(), value: m.owner_id },
+      ownersField(ownersOf(m), { required: false, hint: "Everyone picked shares this item." }),
       { name: "op", label: "Goal is", type: "select", options: [[">=", "≥ at least"], ["<=", "≤ at most"], ["=", "= exactly"], [">", "> more than"], ["<", "< less than"]], value: m.op, half: true },
       { name: "goal", label: "Goal", type: "number", step: "any", value: m.goal, half: true },
       { name: "unit", label: "Format", type: "select", options: [["", "Number"], ["$", "Currency ($)"], ["%", "Percent (%)"]], value: m.unit || "", half: true },
       { name: "sort", label: "Order", type: "number", value: m.sort || 0, half: true },
     ],
-    onSubmit: async (v) => { await api(m.id ? "PUT" : "POST", "measurables" + (m.id ? "/" + m.id : ""), { ...v, team_id: m.team_id, unit: v.unit || "" }); done(); },
+    onSubmit: async (v) => { await api(m.id ? "PUT" : "POST", "measurables" + (m.id ? "/" + m.id : ""), { ...v, owner_ids: idList(v.owner_ids), team_id: m.team_id, unit: v.unit || "" }); done(); },
     onDelete: m.id ? async () => { await api("DELETE", "measurables/" + m.id); done(); } : null,
     extraButtons: m.id ? (c) => [h("button", { class: "btn", type: "button", onclick: () => safe(async () => { await api("PUT", "measurables/" + m.id, { archived: 1 }); c(); done(); toast("Archived"); }) }, "Archive")] : null,
   });
@@ -686,7 +710,9 @@ async function pageChart(view) {
         h("div", { class: "seat-top" }, h("span", {}, s.title),
           h("button", { title: "Add a seat under this one", onclick: () => editSeat({ parent_id: s.id }, seats, reload) }, "+"),
           h("button", { title: "Edit seat", onclick: () => editSeat(s, seats, reload) }, "✎")),
-        h("div", { class: "seat-person" + (s.user_id ? "" : " vacant") }, s.user_id ? [avatar(s.user_id), userName(s.user_id)] : "Open seat"),
+        ownersOf(s, "user_id", "user_ids").length
+          ? ownersOf(s, "user_id", "user_ids").map((id) => h("div", { class: "seat-person" }, avatar(id), userName(id)))
+          : h("div", { class: "seat-person vacant" }, "Open seat"),
         roles.length ? h("ul", { class: "roles" }, roles.map((r) => h("li", {}, r))) : null),
       children.length ? h("ul", {}, children.map(node)) : null);
   };
@@ -707,12 +733,12 @@ function editSeat(s, seats, done) {
     title: s.id ? "Edit seat" : "New seat",
     fields: [
       { name: "title", label: "Seat", value: s.title, required: true, placeholder: "e.g. Sales & Marketing" },
-      { name: "user_id", label: "Person in the seat", type: "select", options: [["", "Open seat"], ...S.users.map((u) => [u.id, u.name])], value: s.user_id },
+      ownersField(ownersOf(s, "user_id", "user_ids"), { name: "user_ids", label: "People in the seat", required: false, hint: "Leave empty for an open seat." }),
       { name: "roles", label: "Roles (one per line)", type: "textarea", value: s.roles, rows: 5, hint: "The 3–5 major responsibilities of this seat." },
       { name: "parent_id", label: "Reports to", type: "select", options: [["", "— Top of chart —"], ...seats.filter((x) => !descendants.has(x.id)).map((x) => [x.id, x.title])], value: s.parent_id, half: true },
       { name: "sort", label: "Order (left → right)", type: "number", value: s.sort || 0, half: true },
     ],
-    onSubmit: async (v) => { await api(s.id ? "PUT" : "POST", "seats" + (s.id ? "/" + s.id : ""), v); done(); },
+    onSubmit: async (v) => { await api(s.id ? "PUT" : "POST", "seats" + (s.id ? "/" + s.id : ""), { ...v, user_ids: idList(v.user_ids) }); done(); },
     onDelete: s.id ? async () => { await api("DELETE", "seats/" + s.id); done(); } : null,
   });
 }
@@ -755,7 +781,7 @@ async function pageVto(view) {
     h("div", { class: "card" }, h("div", { class: "vto-col-title" }, "Vision"), VTO_FIELDS.vision.map(([t2, f]) => section(t2, f))),
     h("div", { class: "card" }, h("div", { class: "vto-col-title" }, "Traction"), VTO_FIELDS.traction.map(([t2, f]) => section(t2, f)),
       h("div", { class: "vto-sec" }, h("h3", {}, `Rocks · ${qtr}`),
-        rocks.length ? h("ol", { class: "vto-list" }, rocks.map((r) => h("li", {}, r.title, " ", h("span", { class: "muted" }, "— " + userName(r.owner_id))))) : h("div", { class: "muted" }, "No rocks this quarter."),
+        rocks.length ? h("ol", { class: "vto-list" }, rocks.map((r) => h("li", {}, r.title, " ", h("span", { class: "muted" }, "— " + ownerNames(ownersOf(r)))))) : h("div", { class: "muted" }, "No rocks this quarter."),
         h("div", { class: "mt" }, h("a", { href: "#/rocks" }, "Manage rocks →"))),
       h("div", { class: "vto-sec" }, h("h3", {}, "Issues list (long-term)"),
         issues.length ? h("ol", { class: "vto-list" }, issues.map((i) => h("li", {}, i.title))) : h("div", { class: "muted" }, "No long-term issues."),

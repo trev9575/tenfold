@@ -250,3 +250,7 @@ table.sc th.name { z-index: 2; }
 .chip .av { width: 22px; height: 22px; font-size: 10px; }
 .chip:has(input:checked) { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
 .chip:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 1px; }
+.avs { display: inline-flex; align-items: center; flex: none; }
+.avs .av + .av { margin-left: -8px; box-shadow: 0 0 0 2px var(--panel); }
+.av.more { background: var(--muted); }
+.seat-person + .seat-person { padding-top: 2px; }
