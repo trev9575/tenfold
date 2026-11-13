@@ -281,3 +281,10 @@ table.sc th.name { z-index: 2; }
 .cal-now { position: absolute; left: 0; right: 0; height: 2px; background: var(--bad); z-index: 2; }
 .cal-now::before { content: ""; position: absolute; left: -5px; top: -4px; width: 10px; height: 10px; border-radius: 50%; background: var(--bad); }
 a.btn { text-decoration: none; color: inherit; }
+
+/* live updates */
+.offscreen { position: absolute; left: -100000px; top: 0; width: calc(100vw - 300px); visibility: hidden; pointer-events: none; }
+.presence { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--side-ink); margin-bottom: 8px; }
+.presence .dot { width: 8px; height: 8px; border-radius: 50%; background: #3ecf8e; box-shadow: 0 0 0 3px rgba(62,207,142,.18); flex: none; }
+.presence.off .dot { background: #8a948f; box-shadow: none; }
+.presence .avs .av { width: 22px; height: 22px; font-size: 9.5px; box-shadow: 0 0 0 2px var(--side); }

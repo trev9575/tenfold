@@ -18,6 +18,7 @@ A small, self-hosted team tool for running your business on EOS®-style practice
 | **Vision / Traction Organizer** | Core values, core focus, 10-year target, marketing strategy, 3-year picture, 1-year plan; pulls in current rocks and long-term issues. Autosaves |
 | **Accountability Chart** | Org chart of seats, the people in each seat, and their roles |
 | **Availability** | Weekly team calendar from everyone's Google Calendar, showing busy blocks per person and highlighting times when everyone is free. Teammates see only busy/free, never event titles |
+| **Live updates** | Changes from friends appear on everyone's screen within about a second, with a note saying who changed what. The sidebar shows who's online, and meetings stay in sync across everyone's screens. Refreshes wait while you're typing |
 | **Teams and people** | Multiple teams, invite-link sign-up, admin-managed accounts, password changes |
 
 | Meeting runner | Accountability chart | Scorecard |
@@ -156,6 +157,8 @@ Don't forward port 8090 straight to the internet. Two good options:
 - **Tailscale (simplest):** install the Tailscale plugin on Unraid and invite your friends to your tailnet (or share the Unraid machine with them). They then use `http://tower-name:8090`.
 - **Reverse proxy with HTTPS:** for example Nginx Proxy Manager, SWAG or Cloudflare Tunnel, with a domain like `tenfold.example.com`. When Tenfold is served over HTTPS, set the container variable `COOKIE_SECURE=true`.
 
+Live updates use a long-lived connection to `/api/events` (Server-Sent Events). Most proxies handle this fine, and Tenfold sends the header that tells nginx not to buffer it. If the sidebar keeps saying "Reconnecting…" behind a proxy, turn off response buffering for that host. In Nginx Proxy Manager, add `proxy_buffering off;` under the host's *Advanced* tab.
+
 ## Updating
 
 When you push changes to `main`, GitHub builds a new image. On Unraid, go to the **Docker** tab, click **Check for Updates**, then **apply update** on Tenfold. Your data in `/mnt/user/appdata/tenfold` is kept.
@@ -188,7 +191,7 @@ python3 server.py
 ## Troubleshooting
 
 - **"pull access denied" or "unauthorized" when installing:** the GHCR package is still private (see Part 1, step 4), or the username in the repository field isn't all lowercase.
-- **The page won't load:** check the container log (Docker tab → Tenfold icon → *Logs*). It should say `Tenfold 1.3.0 running on http://0.0.0.0:8090`. Make sure the host port isn't used by another container.
+- **The page won't load:** check the container log (Docker tab → Tenfold icon → *Logs*). It should say `Tenfold 1.4.0 running on http://0.0.0.0:8090`. Make sure the host port isn't used by another container.
 - **You keep getting signed out over plain HTTP:** make sure `COOKIE_SECURE` is `false` unless you're using HTTPS.
 - **Forgot the admin password:** another admin can reset it under Settings → People. If you were the only admin, stop the container, delete `tenfold.db`, and start over (this erases everything), or ask for help resetting it with `sqlite3`.
 

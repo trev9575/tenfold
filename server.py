@@ -14,6 +14,8 @@ import secrets
 import sqlite3
 import sys
 import time
+import queue
+import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -32,7 +34,7 @@ PORT = int(os.environ.get("PORT", "8090"))
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
 SESSION_DAYS = int(os.environ.get("SESSION_DAYS", "30"))
 COOKIE_NAME = "tf_session"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -202,6 +204,49 @@ def decode_ids(text, fallback):
     return [fallback] if fallback else []
 
 
+class Hub:
+    """Live updates: every open browser tab holds a Server-Sent Events stream."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.clients = {}  # client_id -> (user_id, queue)
+
+    def subscribe(self, client_id, user_id):
+        q = queue.Queue(maxsize=200)
+        with self.lock:
+            self.clients[client_id] = (user_id, q)
+        self.publish_presence()
+        return q
+
+    def unsubscribe(self, client_id, q):
+        with self.lock:
+            if self.clients.get(client_id, (None, None))[1] is q:
+                del self.clients[client_id]
+        self.publish_presence()
+
+    def online(self):
+        with self.lock:
+            return sorted({uid for uid, _ in self.clients.values()})
+
+    def publish(self, event):
+        data = json.dumps(event)
+        with self.lock:
+            targets = [q for _, q in self.clients.values()]
+        for q in targets:
+            try:
+                q.put_nowait(data)
+            except queue.Full:
+                pass  # a stuck client just misses events; it refreshes on reconnect
+
+    def publish_presence(self):
+        self.publish({"type": "presence", "online": self.online()})
+
+
+HUB = Hub()
+# API calls that change shared data and should notify everyone else.
+SILENT_HEADS = {"login", "logout", "setup", "health", "status", "events"}
+
+
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -322,6 +367,11 @@ class Handler(BaseHTTPRequestHandler):
         self.query = {k: v[0] for k, v in parse_qs(url.query).items()}
         path = url.path
         self.new_cookie = None
+        self.client_id = (self.headers.get("X-Client-Id") or "")[:64]
+        self._body = {}
+        if path == "/api/events" and method == "GET":
+            self.events_stream()
+            return
         if path.startswith("/api/"):
             conn = db()
             try:
@@ -329,6 +379,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.api(conn, method, parts)
                 conn.commit()
                 self.send_json(200, result if result is not None else {"ok": True})
+                if method != "GET" and parts and parts[0] not in SILENT_HEADS:
+                    self.announce(parts, result)
             except ApiError as e:
                 conn.rollback()
                 self.send_json(e.status, {"error": e.msg})
@@ -362,8 +414,59 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, "Invalid JSON")
             if not isinstance(data, dict):
                 raise ApiError(400, "Expected a JSON object")
+            self._body = data
             return data
         return {}
+
+    def announce(self, parts, result):
+        user = getattr(self, "user", None)
+        team = None
+        if isinstance(result, dict) and result.get("team_id"):
+            team = result["team_id"]
+        elif self._body.get("team_id"):
+            team = self._body.get("team_id")
+        elif parts[0] == "vto" and len(parts) > 1 and parts[1].isdigit():
+            team = int(parts[1])
+        resource = {"me": "users", "register": "users", "invite": "settings", "scores": "measurables"}.get(parts[0], parts[0])
+        if parts[0] == "me" and len(parts) > 1 and parts[1] == "calendar":
+            resource = "availability"
+        HUB.publish({
+            "type": "change", "resource": resource, "team_id": team, "method": self.command,
+            "user_id": user["id"] if user else None, "client": self.client_id,
+        })
+
+    def events_stream(self):
+        conn = db()
+        try:
+            user = self.current_user(conn)
+        finally:
+            conn.close()
+        if not user:
+            self.send_json(401, {"error": "Not signed in"})
+            return
+        client_id = (self.query.get("client") or secrets.token_hex(8))[:64]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")  # tell nginx-style proxies not to buffer
+        self.end_headers()
+        self.close_connection = True
+        q = HUB.subscribe(client_id, user["id"])
+        try:
+            hello = json.dumps({"type": "hello", "version": VERSION, "online": HUB.online()})
+            self.wfile.write(f"retry: 3000\ndata: {hello}\n\n".encode())
+            self.wfile.flush()
+            while True:
+                try:
+                    data = q.get(timeout=20)
+                    self.wfile.write(f"data: {data}\n\n".encode())
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")  # keeps proxies from closing an idle stream
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            HUB.unsubscribe(client_id, q)
 
     def send_json(self, status, obj):
         data = json.dumps(obj).encode()

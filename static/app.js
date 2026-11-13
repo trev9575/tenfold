@@ -22,8 +22,10 @@ function h(tag, attrs, ...kids) {
   return el;
 }
 
+const CLIENT_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
+
 async function api(method, path, body) {
-  const opts = { method, headers: {}, credentials: "same-origin" };
+  const opts = { method, headers: { "X-Client-Id": CLIENT_ID }, credentials: "same-origin" };
   if (method !== "GET") {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body || {});
@@ -202,21 +204,23 @@ function renderShell() {
     S.teams.length ? teamSel : null,
     h("nav", { class: "nav" }, NAV.map(([href, ico, label]) => href === "sep" ? h("div", { class: "nav-sep" }) :
       h("a", { href, "data-href": href, onclick: () => side.classList.remove("open") }, h("span", { class: "ico" }, ico), label))),
-    h("div", { class: "side-foot" }, h("div", {}, S.me.name), h("button", { onclick: logout }, "Sign out")));
+    h("div", { class: "side-foot" }, h("div", { id: "presence" }), h("div", {}, S.me.name), h("button", { onclick: logout }, "Sign out")));
   const main = h("main", { class: "main", id: "view" });
   app.append(h("div", { class: "shell" }, side, main));
+  renderPresence();
 }
 
-async function logout() { await safe(() => api("POST", "logout")); S.me = null; location.hash = ""; boot(); }
+async function logout() { await safe(() => api("POST", "logout")); stopLive(); S.me = null; location.hash = ""; boot(); }
 
 const ROUTES = {
   home: pageHome, meetings: pageMeetings, meeting: pageMeeting, scorecard: pageScorecard, rocks: pageRocks,
   todos: pageTodos, issues: pageIssues, availability: pageAvailability, headlines: pageHeadlines, vto: pageVto, chart: pageChart, settings: pageSettings,
 };
 
-async function route() {
+let routeSeq = 0;
+async function route(soft = false) {
   if (!S.me) return;
-  clearTimers();
+  const seq = ++routeSeq;
   const [name, arg] = (location.hash.replace(/^#\/?/, "") || "home").split("/");
   const fn = ROUTES[name] || pageHome;
   document.querySelectorAll(".nav a").forEach((a) => a.classList.toggle("active", a.dataset.href === "#/" + (name === "meeting" ? "meetings" : name)));
@@ -224,8 +228,99 @@ async function route() {
   if (!view) return;
   // Fresh container per navigation, so a slow page that finishes late renders into a detached node.
   const page = h("div");
-  view.replaceChildren(page);
+  if (soft !== true || !view.firstElementChild) {
+    clearTimers();
+    view.replaceChildren(page);
+    await safe(() => fn(page, arg));
+    return;
+  }
+  // Live refresh: build the new version off-screen, then swap it in so nothing flickers or jumps.
+  const scrollers = () => [...view.querySelectorAll(".cal-wrap, .sc-wrap, .chart-scroll")];
+  const saved = scrollers().map((e) => [e.scrollLeft, e.scrollTop]);
+  const winY = window.scrollY;
+  page.className = "offscreen";
+  view.append(page);
+  const oldTimers = S.timers;
+  S.timers = [];
   await safe(() => fn(page, arg));
+  if (seq !== routeSeq || !page.isConnected) { page.remove(); return; }
+  if (userIsBusy()) { S.timers.forEach(clearInterval); S.timers = oldTimers; page.remove(); live.pending = true; return; }
+  oldTimers.forEach(clearInterval);
+  [...view.children].forEach((c) => { if (c !== page) c.remove(); });
+  page.className = "";
+  scrollers().forEach((e, i) => { if (saved[i]) { e.scrollLeft = saved[i][0]; e.scrollTop = saved[i][1]; } });
+  window.scrollTo(0, winY);
+}
+
+// ---------------------------------------------------------------- live updates
+const RESOURCE_LABELS = {
+  issues: "Issues", todos: "To-Dos", rocks: "Rocks", measurables: "the Scorecard", headlines: "Headlines", meetings: "a meeting",
+  seats: "the Accountability Chart", vto: "the V/TO", users: "People", teams: "Teams", availability: "their calendar", settings: "Settings",
+};
+const live = { es: null, pending: false, needBasics: false, online: [], version: null, lastToast: {} };
+
+function userIsBusy() {
+  if ($("#modal-root") && $("#modal-root").children.length) return true;
+  const a = document.activeElement;
+  return !!(a && a.closest && a.closest("#view") && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.type !== "checkbox");
+}
+
+function startLive() {
+  stopLive();
+  if (!window.EventSource) return;
+  const es = new EventSource("/api/events?client=" + encodeURIComponent(CLIENT_ID));
+  live.es = es;
+  let first = true;
+  es.onmessage = (msg) => {
+    let ev; try { ev = JSON.parse(msg.data); } catch (e) { return; }
+    if (ev.type === "hello") {
+      if (live.version && ev.version !== live.version) { location.reload(); return; } // Tenfold was updated on the server
+      live.version = ev.version;
+      live.online = ev.online || [];
+      renderPresence();
+      if (!first) { live.pending = true; live.needBasics = true; } // reconnected: catch up on anything missed
+      first = false;
+    } else if (ev.type === "presence") {
+      live.online = ev.online || [];
+      renderPresence();
+    } else if (ev.type === "change" && ev.client !== CLIENT_ID) {
+      if (["users", "teams", "settings"].includes(ev.resource)) live.needBasics = true;
+      live.pending = true;
+      const who = ev.user_id && ev.user_id !== S.me.id ? userName(ev.user_id) : null;
+      const key = `${ev.user_id}|${ev.resource}`;
+      if (who && Date.now() - (live.lastToast[key] || 0) > 15000) {
+        live.lastToast[key] = Date.now();
+        toast(`${who} updated ${RESOURCE_LABELS[ev.resource] || ev.resource}`);
+      }
+    }
+  };
+  es.addEventListener("error", () => { live.online = []; renderPresence(true); });
+}
+
+function stopLive() { if (live.es) { live.es.close(); live.es = null; } }
+
+async function applyLiveUpdate() {
+  if (!live.pending || !S.me || userIsBusy()) return;
+  live.pending = false;
+  if (live.needBasics) {
+    live.needBasics = false;
+    await safe(loadBasics);
+    const sel = $(".side select");
+    if (sel) {
+      sel.replaceChildren(...S.teams.map((t) => h("option", { value: t.id, selected: t.id === S.teamId }, t.name)));
+    } else if (S.teams.length) { renderShell(); route(); return; }
+  }
+  await route(true);
+}
+setInterval(applyLiveUpdate, 700);
+
+function renderPresence(offline) {
+  const el = $("#presence");
+  if (!el || !S.me) return;
+  const others = live.online.filter((id) => id !== S.me.id && userById(id));
+  el.replaceChildren(
+    h("div", { class: "presence" + (offline || !live.es || live.es.readyState === 2 ? " off" : "") },
+      h("i", { class: "dot" }), others.length ? ["Online", avatars(others)] : live.es && live.es.readyState === 1 ? "Live" : "Reconnecting…"));
 }
 
 function pageHead(title, sub, ...actions) {
@@ -258,6 +353,7 @@ async function boot() {
   await loadBasics();
   renderShell();
   route();
+  startLive();
 }
 
 async function loadBasics() {
@@ -854,6 +950,8 @@ async function pageMeeting(view, id) {
   S.teamId = m.team_id;
   const d = Object.assign({ section: 0, sectionStart: Date.now(), elapsed: {}, notes: {}, ratings: {} }, JSON.parse(m.data || "{}"));
   const persist = () => api("PUT", "meetings/" + m.id, { data: JSON.stringify(d) }).catch(() => {});
+  let saveT;
+  const saveSoon = () => { clearTimeout(saveT); saveT = setTimeout(persist, 800); };
   const secElapsed = (i) => (d.elapsed[i] || 0) + (i === d.section ? Date.now() - d.sectionStart : 0);
 
   const totalClock = h("span", { class: "clock" });
@@ -910,29 +1008,29 @@ async function pageMeeting(view, id) {
     } else if (key === "scorecard") {
       content.append(h("div", { class: "prompt" }, "Report on each number: on track or off track. No discussion; drop anything off track to Issues."));
       const box = h("div"); content.append(box);
-      scorecardPanel(box, { weeks: 6 });
+      return scorecardPanel(box, { weeks: 6 });
     } else if (key === "rocks") {
       content.append(h("div", { class: "prompt" }, "Each owner says “on track” or “off track”. Off-track rocks go to Issues."));
       const box = h("div"); content.append(box);
-      rocksPanel(box, { meeting: true, noQuarter: true });
+      return rocksPanel(box, { meeting: true, noQuarter: true });
     } else if (key === "headlines") {
       content.append(h("div", { class: "prompt" }, "Quick customer and employee headlines. Anything needing discussion drops to Issues."));
       const box = h("div"); content.append(box);
-      headlinesPanel(box, { meeting: true });
+      return headlinesPanel(box, { meeting: true });
     } else if (key === "todos") {
       content.append(h("div", { class: "prompt" }, "Review last week's to-dos: done or not done. Check them off as you go."));
       const box = h("div"); content.append(box);
-      todosPanel(box, { teamId: S.teamId, title: "Team to-dos" });
+      return todosPanel(box, { teamId: S.teamId, title: "Team to-dos" });
     } else if (key === "ids") {
       content.append(h("div", { class: "prompt" }, h("b", {}, "Identify, Discuss, Solve. "), "Pick your top 3 issues (click the circle to rank them), then work them in order. Create to-dos as you solve."));
       const box = h("div"); content.append(box);
-      issuesPanel(box, { meeting: true, onChange: async () => {
+      return issuesPanel(box, { meeting: true, onChange: async () => {
         const solved = await api("GET", `issues?team_id=${S.teamId}&status=solved`);
         d.solved = solved.filter((i) => i.solved_at && i.solved_at >= m.started_at.slice(0, 19)).map((i) => i.title);
         persist();
       } });
     } else if (key === "conclude") {
-      renderConclude();
+      return renderConclude();
     }
   }
 
@@ -943,12 +1041,12 @@ async function pageMeeting(view, id) {
     const solvedNow = solved.filter((i) => i.solved_at && i.solved_at >= startedIso);
     const ratingInputs = S.users.map((u) => {
       const inp = h("input", { type: "number", min: 1, max: 10, class: "input", value: d.ratings[u.id] || "" });
-      inp.addEventListener("input", () => { if (inp.value) d.ratings[u.id] = Number(inp.value); else delete d.ratings[u.id]; });
+      inp.addEventListener("input", () => { if (inp.value) d.ratings[u.id] = Number(inp.value); else delete d.ratings[u.id]; saveSoon(); });
       return h("div", { class: "r" }, avatar(u.id), h("span", {}, u.name), inp);
     });
     const cascade = h("textarea", { class: "input", rows: 4, placeholder: "What needs to be communicated, to whom, and by whom?" });
     cascade.value = d.notes.cascade || "";
-    cascade.addEventListener("input", () => { d.notes.cascade = cascade.value; });
+    cascade.addEventListener("input", () => { d.notes.cascade = cascade.value; saveSoon(); });
     content.append(
       h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Recap"), h("span", { class: "pill neutral" }, `${newTodos.length} new to-do${newTodos.length === 1 ? "" : "s"}`), h("span", { class: "pill done" }, `${solvedNow.length} issue${solvedNow.length === 1 ? "" : "s"} solved`)),
         h("ul", { class: "rows" }, newTodos.length ? newTodos.map((t) => h("li", { class: "rowi" }, avatar(t.owner_id), h("div", { class: "title" }, h("div", { class: "t" }, t.title)), h("span", { class: "meta" }, "Due " + fmtDate(t.due_date)))) : h("li", { class: "empty" }, "No new to-dos this meeting."))),
@@ -977,13 +1075,15 @@ async function pageMeeting(view, id) {
     h("div", {}, h("div", { class: "lbl" }, "This section"), secClock),
     h("span", { style: { flex: 1 } }), nextBtn));
   view.append(h("div", { class: "mtg" }, agenda, content));
-  renderSection();
+  await renderSection();
   tick();
   S.timers.push(setInterval(tick, 1000));
 }
 
 // ---- availability (Google Calendar via secret iCal link)
 const HOUR_PX = 44;
+let sessionWeekOffset = 0;
+window.addEventListener("hashchange", () => { if (!location.hash.startsWith("#/availability")) sessionWeekOffset = 0; });
 const HOUR_RANGES = { work: [8, 18, "Work hours"], day: [7, 22, "7am–10pm"], all: [0, 24, "24 hours"] };
 
 function calendarConnectCard(onDone) {
@@ -1010,8 +1110,8 @@ function calendarConnectCard(onDone) {
 }
 
 async function pageAvailability(view) {
-  let weekOffset = Number(store.get("tf_av_week_off") || 0);
-  if (Math.abs(weekOffset) > 8) weekOffset = 0;
+  // Week offset lives only for this browser tab session, so the page always opens on the current week.
+  let weekOffset = Number(sessionWeekOffset || 0);
   const rangeKey = HOUR_RANGES[store.get("tf_av_hours")] ? store.get("tf_av_hours") : "day";
   const [h0, h1] = HOUR_RANGES[rangeKey];
   const mon = parseYmd(weekStart());
@@ -1019,7 +1119,7 @@ async function pageAvailability(view) {
   const days = [...Array(7)].map((_, i) => { const d = new Date(mon); d.setDate(d.getDate() + i); return d; });
   const start = new Date(mon), end = new Date(mon); end.setDate(end.getDate() + 7);
   const tzName = Intl.DateTimeFormat().resolvedOptions().timeZone;
-  const go = (off) => { store.set("tf_av_week_off", String(off)); route(); };
+  const go = (off) => { sessionWeekOffset = off; route(); };
 
   view.append(pageHead("Availability", `When your team is busy or free · times shown in ${tzName}`,
     h("div", { class: "seg" }, Object.entries(HOUR_RANGES).map(([k, [, , label]]) => h("button", { class: k === rangeKey ? "on" : "", onclick: () => { store.set("tf_av_hours", k); route(); } }, label))),
