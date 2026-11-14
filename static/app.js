@@ -187,6 +187,7 @@ const NAV = [
   ["#/issues", "!", "Issues"],
   ["#/headlines", "❝", "Headlines"],
   ["#/boards", "▦", "Boards"],
+  ["#/expenses", "$", "Expenses"],
   ["#/availability", "▥", "Availability"],
   ["sep"],
   ["#/vto", "◎", "Vision / Traction"],
@@ -215,7 +216,7 @@ async function logout() { await safe(() => api("POST", "logout")); stopLive(); S
 
 const ROUTES = {
   home: pageHome, meetings: pageMeetings, meeting: pageMeeting, scorecard: pageScorecard, rocks: pageRocks,
-  todos: pageTodos, issues: pageIssues, availability: pageAvailability, boards: pageBoards, headlines: pageHeadlines, vto: pageVto, chart: pageChart, settings: pageSettings,
+  todos: pageTodos, issues: pageIssues, availability: pageAvailability, boards: pageBoards, expenses: pageExpenses, headlines: pageHeadlines, vto: pageVto, chart: pageChart, settings: pageSettings,
 };
 
 let routeSeq = 0;
@@ -262,7 +263,7 @@ async function route(soft = false) {
 // ---------------------------------------------------------------- live updates
 const RESOURCE_LABELS = {
   issues: "Issues", todos: "To-Dos", rocks: "Rocks", measurables: "the Scorecard", headlines: "Headlines", meetings: "a meeting",
-  seats: "the Accountability Chart", vto: "the V/TO", boards: "Boards", board_columns: "a board", users: "People", teams: "Teams", availability: "their calendar", settings: "Settings",
+  seats: "the Accountability Chart", vto: "the V/TO", boards: "Boards", board_columns: "a board", expenses: "Expenses", users: "People", teams: "Teams", availability: "their calendar", settings: "Settings",
 };
 const live = { es: null, pending: false, needBasics: false, online: [], version: null, lastToast: {} };
 
@@ -1709,6 +1710,194 @@ async function pageAvailability(view) {
 }
 const fmtTime = (d) => d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
 
+// ---- expenses
+const EXPENSE_CATEGORIES = ["Parts & materials", "Prototyping", "Tools & equipment", "Software & subscriptions", "Shipping",
+  "Marketing", "Legal & fees", "Travel", "Meals", "Other"];
+const REIMBURSE = { none: "Company paid", owed: "Owed", paid: "Paid back" };
+const REIMBURSE_PILL = { none: "neutral", owed: "warn", paid: "on" };
+const money = (cents) => (cents < 0 ? "-" : "") + "$" + (Math.abs(cents || 0) / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+function parseMoney(v) {
+  const n = Number(String(v || "").replace(/[$,\s]/g, ""));
+  return Number.isFinite(n) ? Math.round(n * 100) : NaN;
+}
+const expenseFilter = { period: "this-month", category: "", project: "", paid_by: "", reimburse: "", q: "" };
+function periodRange(p) {
+  const now = new Date(), y = now.getFullYear(), m = now.getMonth();
+  const d = (yy, mm, dd) => ymd(new Date(yy, mm, dd));
+  switch (p) {
+    case "this-month": return [d(y, m, 1), d(y, m + 1, 0)];
+    case "last-month": return [d(y, m - 1, 1), d(y, m, 0)];
+    case "this-quarter": { const q = Math.floor(m / 3) * 3; return [d(y, q, 1), d(y, q + 3, 0)]; }
+    case "this-year": return [d(y, 0, 1), d(y, 11, 31)];
+    case "last-year": return [d(y - 1, 0, 1), d(y - 1, 11, 31)];
+    default: return [null, null];
+  }
+}
+const PERIODS = [["this-month", "This month"], ["last-month", "Last month"], ["this-quarter", "This quarter"], ["this-year", "This year"], ["last-year", "Last year"], ["all", "All time"]];
+
+async function pageExpenses(view) {
+  if (needTeam(view)) return;
+  const [all, boards] = await Promise.all([api("GET", "expenses?team_id=" + S.teamId), api("GET", "boards?team_id=" + S.teamId), allRocks()]);
+  const reload = () => route();
+  const f = expenseFilter;
+  const [from, to] = periodRange(f.period);
+  const inPeriod = all.filter((e) => (!from || e.date >= from) && (!to || e.date <= to));
+  const q = f.q.trim().toLowerCase();
+  const shown = inPeriod.filter((e) =>
+    (!f.category || e.category === f.category) && (!f.project || (e.project || "") === f.project) &&
+    (!f.paid_by || String(e.paid_by) === f.paid_by) && (!f.reimburse || e.reimburse === f.reimburse) &&
+    (!q || [e.title, e.vendor, e.notes, e.category, e.project].some((x) => (x || "").toLowerCase().includes(q))));
+  const sum = (xs) => xs.reduce((a, e) => a + (e.amount_cents || 0), 0);
+  const owedAll = all.filter((e) => e.reimburse === "owed");
+  const projects = [...new Set([...all.map((e) => e.project), ...boards.map((b) => b.name)].filter(Boolean))].sort();
+  const categories = [...new Set([...EXPENSE_CATEGORIES, ...all.map((e) => e.category)].filter(Boolean))];
+
+  const newBtn = h("button", { class: "btn primary", onclick: () => editExpense({ team_id: S.teamId, date: today(), paid_by: S.me.id, reimburse: "owed" }, { projects, categories }, reload) }, "+ Expense");
+  const exportBtn = h("button", { class: "btn", onclick: () => exportExpenses(shown) }, "Export CSV");
+  view.append(pageHead("Expenses", teamName(S.teamId) + " · what the team is spending on its projects", exportBtn, newBtn));
+
+  const sel = (k, label, opts) => h("select", { class: "input fsel", "data-live-ok": "ef-" + k, "aria-label": label, onchange: (e) => { f[k] = e.target.value; reload(); } },
+    h("option", { value: "" }, label + ": all"), opts.map(([v, l]) => h("option", { value: v, selected: String(f[k]) === String(v) }, l)));
+  const search = h("input", { class: "input kq", type: "search", placeholder: "Search…", value: f.q, "data-live-ok": "ef-q", "aria-label": "Search expenses" });
+  let qT;
+  search.addEventListener("input", () => { clearTimeout(qT); qT = setTimeout(() => { f.q = search.value; reload(); }, 300); });
+  view.append(h("div", { class: "filters" },
+    h("select", { class: "input fsel", "data-live-ok": "ef-period", "aria-label": "Period", onchange: (e) => { f.period = e.target.value; reload(); } },
+      PERIODS.map(([v, l]) => h("option", { value: v, selected: f.period === v }, l))),
+    search,
+    sel("category", "Category", categories.map((c) => [c, c])),
+    sel("project", "Project", projects.map((p) => [p, p])),
+    sel("paid_by", "Paid by", S.users.map((u) => [u.id, u.name])),
+    sel("reimburse", "Reimbursement", Object.entries(REIMBURSE))));
+
+  // summary
+  const byCat = new Map(), byProject = new Map(), byPerson = new Map();
+  for (const e of shown) {
+    byCat.set(e.category || "Uncategorized", (byCat.get(e.category || "Uncategorized") || 0) + e.amount_cents);
+    byProject.set(e.project || "No project", (byProject.get(e.project || "No project") || 0) + e.amount_cents);
+    byPerson.set(e.paid_by || 0, (byPerson.get(e.paid_by || 0) || 0) + e.amount_cents);
+  }
+  const owedByPerson = new Map();
+  for (const e of owedAll) owedByPerson.set(e.paid_by || 0, (owedByPerson.get(e.paid_by || 0) || 0) + e.amount_cents);
+  const periodLabel = (PERIODS.find(([v]) => v === f.period) || [, ""])[1];
+  view.append(h("div", { class: "stats" },
+    h("div", { class: "stat" }, h("div", { class: "n" }, money(sum(shown))), h("div", { class: "l" }, `Spent · ${periodLabel.toLowerCase()}${shown.length !== inPeriod.length ? " (filtered)" : ""}`)),
+    h("div", { class: "stat" }, h("div", { class: "n" }, shown.length), h("div", { class: "l" }, "Expenses")),
+    h("div", { class: "stat" }, h("div", { class: "n" }, money(sum(owedAll))), h("div", { class: "l" }, "Owed back to people (all time)")),
+    h("div", { class: "stat" }, h("div", { class: "n" }, money(sum(all))), h("div", { class: "l" }, "Total spent (all time)"))));
+
+  const bars = (title, map, label) => {
+    const rows = [...map.entries()].sort((a, b) => b[1] - a[1]);
+    const max = Math.max(1, ...rows.map(([, v]) => Math.abs(v)));
+    return h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, title)),
+      h("div", { class: "card-body" }, rows.length ? rows.map(([k, v]) => h("div", { class: "brow" },
+        h("div", { class: "bl" }, label(k)), h("div", { class: "bt" }, h("i", { style: { width: (100 * Math.abs(v) / max) + "%" } })), h("div", { class: "bv" }, money(v)))) :
+        h("div", { class: "muted" }, "Nothing in this period.")));
+  };
+  const personLabel = (id) => id ? [avatar(id), " ", userName(id)] : "Unknown";
+  const breakdown = h("div", { class: "grid3 mt" },
+    bars("By category", byCat, (k) => k),
+    bars("By project", byProject, (k) => k),
+    owedByPerson.size ? bars("Owed back to", owedByPerson, personLabel) : bars("Paid by", byPerson, personLabel));
+  if (shown.length || owedByPerson.size) view.append(breakdown);
+
+  // list
+  const list = h("table", { class: "xt" },
+    h("thead", {}, h("tr", {}, h("th", {}, "Date"), h("th", {}, "Expense"), h("th", { class: "hide-sm" }, "Category"), h("th", { class: "hide-sm" }, "Project"),
+      h("th", { class: "hide-sm" }, "Paid by"), h("th", {}, "Status"), h("th", { class: "num" }, "Amount"))),
+    h("tbody", {}, shown.length ? shown.map((e) => h("tr", { onclick: (ev) => { if (!ev.target.closest("a, button")) editExpense(e, { projects, categories }, reload); } },
+      h("td", { class: "nowrap" }, fmtDate(e.date)),
+      h("td", {}, h("div", { class: "t" }, e.title, e.receipt_file ? h("a", { class: "rcpt", href: "/api/receipts/" + e.id, target: "_blank", rel: "noopener", title: "Open receipt" }, " 📎") : null),
+        h("div", { class: "d" }, [e.vendor, e.rock_id && rockTitle(e.rock_id) ? "▲ " + rockTitle(e.rock_id) : null].filter(Boolean).join(" · "))),
+      h("td", { class: "hide-sm" }, e.category ? h("span", { class: "ktag c-" + tagColor(e.category) }, e.category) : ""),
+      h("td", { class: "hide-sm" }, e.project || ""),
+      h("td", { class: "hide-sm" }, e.paid_by ? avatar(e.paid_by) : ""),
+      h("td", {}, h("button", {
+        class: "pill " + REIMBURSE_PILL[e.reimburse], title: "Click to change",
+        onclick: () => safe(async () => { const next = { none: "owed", owed: "paid", paid: "none" }[e.reimburse]; await api("PUT", "expenses/" + e.id, { reimburse: next }); reload(); }),
+      }, REIMBURSE[e.reimburse])),
+      h("td", { class: "num" }, money(e.amount_cents)))) :
+      h("tr", {}, h("td", { colspan: 7, class: "empty" }, all.length ? "No expenses match these filters." : "No expenses yet. Add the first one with + Expense."))),
+    shown.length ? h("tfoot", {}, h("tr", {}, h("td", { colspan: 3 }, "Total"), h("td", { class: "hide-sm", colspan: 3 }), h("td", { class: "num" }, money(sum(shown))))) : null);
+  view.append(h("div", { class: "card mt" }, h("div", { class: "xt-wrap" }, list)));
+}
+
+function exportExpenses(rows) {
+  const esc = (v) => { const s = v == null ? "" : String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  const head = ["Date", "Description", "Amount", "Category", "Vendor", "Paid by", "Project", "Rock", "Reimbursement", "Notes", "Receipt"];
+  const lines = [head.join(",")].concat(rows.map((e) => [e.date, e.title, (e.amount_cents / 100).toFixed(2), e.category, e.vendor,
+    e.paid_by ? userName(e.paid_by) : "", e.project, e.rock_id ? rockTitle(e.rock_id) : "", REIMBURSE[e.reimburse], e.notes,
+    e.receipt_name || ""].map(esc).join(",")));
+  const blob = new Blob([lines.join("\n")], { type: "text/csv" });
+  const a = h("a", { href: URL.createObjectURL(blob), download: `${teamName(S.teamId)} expenses ${today()}.csv` });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+function editExpense(e, { projects, categories }, done) {
+  const teamRocks = rockCache.list.filter((r) => r.team_id === (e.team_id || S.teamId));
+  const field = (label, el, hint) => h("div", { class: "field" }, h("label", {}, label), el, hint ? h("div", { class: "hint" }, hint) : null);
+  const title = h("input", { value: e.title || "", placeholder: "What was it for?" });
+  const amount = h("input", { value: e.amount_cents != null ? (e.amount_cents / 100).toFixed(2) : "", inputmode: "decimal", placeholder: "0.00" });
+  const date = h("input", { type: "date", value: e.date || today() });
+  const catList = "exp-cats", projList = "exp-projects";
+  const category = h("input", { value: e.category || "", list: catList, placeholder: "Pick or type a category" });
+  const vendor = h("input", { value: e.vendor || "", placeholder: "e.g. DigiKey, Amazon, JLCPCB" });
+  const paidBy = h("select", {}, h("option", { value: "" }, "—"), S.users.map((u) => h("option", { value: u.id, selected: u.id === e.paid_by }, u.name)));
+  const reimburse = h("select", {}, Object.entries(REIMBURSE).map(([v, l]) => h("option", { value: v, selected: (e.reimburse || "none") === v }, l === "Company paid" ? "Company paid (nothing owed)" : l === "Owed" ? "Owed back to the person who paid" : "Paid back")));
+  const project = h("input", { value: e.project || "", list: projList, placeholder: "Pick a board or type a project" });
+  const rock = h("select", {}, h("option", { value: "" }, "No rock"), teamRocks.map((r) => h("option", { value: r.id, selected: r.id === e.rock_id }, r.title)));
+  const notes = h("textarea", { rows: 2 });
+  notes.value = e.notes || "";
+  const file = h("input", { type: "file", accept: "image/*,application/pdf,.heic,.heif" });
+  const current = e.receipt_file ? h("div", { class: "hint" }, "Current receipt: ", h("a", { href: "/api/receipts/" + e.id, target: "_blank", rel: "noopener" }, e.receipt_name || "open"), " · ",
+    h("a", { href: "#", onclick: (ev) => { ev.preventDefault(); removeReceipt = true; current.textContent = "Receipt will be removed when you save."; } }, "remove")) : null;
+  let removeReceipt = false;
+  const body = h("form", { onsubmit: (ev) => { ev.preventDefault(); save(); } },
+    field("Description", title),
+    h("div", { class: "row-fields" }, field("Amount ($)", amount), field("Date", date)),
+    h("div", { class: "row-fields" }, field("Category", category), field("Vendor", vendor)),
+    h("div", { class: "row-fields" }, field("Paid by", paidBy), field("Reimbursement", reimburse)),
+    h("div", { class: "row-fields" }, field("Project", project), field("Rock", rock)),
+    field("Notes", notes),
+    field("Receipt", file, current || "Photo or PDF, up to 15 MB. On a phone you can take a picture."),
+    h("datalist", { id: catList }, categories.map((c) => h("option", { value: c }))),
+    h("datalist", { id: projList }, projects.map((p) => h("option", { value: p }))),
+    h("button", { type: "submit", style: { display: "none" } }));
+  let close;
+  async function save() {
+    const cents = parseMoney(amount.value);
+    if (!title.value.trim()) { toast("Add a description", true); title.focus(); return; }
+    if (Number.isNaN(cents) || amount.value.trim() === "") { toast("Enter an amount, like 24.99", true); amount.focus(); return; }
+    if (!date.value) { toast("Pick a date", true); return; }
+    const f0 = file.files[0];
+    if (f0 && f0.size > 15 * 1024 * 1024) { toast("Receipts can be up to 15 MB", true); return; }
+    await safe(async () => {
+      const payload = {
+        team_id: e.team_id || S.teamId, title: title.value.trim(), amount_cents: cents, date: date.value, category: category.value.trim() || null,
+        vendor: vendor.value.trim() || null, paid_by: paidBy.value ? Number(paidBy.value) : null, reimburse: reimburse.value,
+        project: project.value.trim() || null, rock_id: rock.value ? Number(rock.value) : null, notes: notes.value.trim() || null,
+      };
+      const saved = await api(e.id ? "PUT" : "POST", "expenses" + (e.id ? "/" + e.id : ""), payload);
+      if (f0) {
+        const data = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1] || ""); r.onerror = () => rej(new Error("Couldn't read the receipt")); r.readAsDataURL(f0); });
+        await api("POST", `expenses/${saved.id}/receipt`, { filename: f0.name, data });
+      } else if (removeReceipt) {
+        await api("DELETE", `expenses/${saved.id}/receipt`);
+      }
+      close();
+      done();
+    });
+  }
+  close = openModal(e.id ? "Edit expense" : "New expense", body, (c) => [
+    e.id ? h("button", { class: "btn danger", type: "button", onclick: () => { if (confirm("Delete this expense and its receipt?")) safe(async () => { await api("DELETE", "expenses/" + e.id); c(); done(); }); } }, "Delete") : null,
+    h("span", { class: "spacer" }),
+    h("button", { class: "btn", type: "button", onclick: c }, "Cancel"),
+    h("button", { class: "btn primary", type: "button", onclick: save }, "Save"),
+  ]);
+  title.focus();
+}
+
 // ---- settings / admin
 async function pageSettings(view) {
   view.append(pageHead("Settings", "Your profile" + (S.me.is_admin ? ", teams and people" : "")));
@@ -1728,6 +1917,14 @@ async function pageSettings(view) {
   if (!S.me.is_admin) return;
 
   const reload = async () => { await loadBasics(); renderShell(); route(); };
+
+  // Backup (admins only; the server refuses everyone else too)
+  const backupBtn = h("a", { class: "btn primary", href: "/api/admin/backup", download: "" }, "⬇ Download backup");
+  view.append(h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Backup"), h("span", { class: "pill done" }, "Admins only")),
+    h("div", { class: "card-body" },
+      h("p", { class: "muted", style: { marginTop: 0 } }, "Downloads a zip to this device with a full copy of the database (every team, person, to-do, board, rock, meeting and expense) plus all receipt files. It's safe to do while people are using Tenfold."),
+      backupBtn,
+      h("p", { class: "hint" }, "To restore, follow RESTORE.txt inside the zip: stop the container, put tenfold.db and the receipts folder back in /mnt/user/appdata/tenfold, and start it again."))));
 
   // Invite link
   const inviteBody = h("div", { class: "card-body" });

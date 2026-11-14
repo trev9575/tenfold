@@ -16,6 +16,8 @@ import mimetypes
 import zipfile
 import os
 import secrets
+import shutil
+import tempfile
 import sqlite3
 import sys
 import time
@@ -34,12 +36,16 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(BASE_DIR, "data"))
 DB_PATH = os.path.join(DATA_DIR, "tenfold.db")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
+RECEIPT_DIR = os.path.join(DATA_DIR, "receipts")
+RECEIPT_MAX = 15 * 1024 * 1024
+RECEIPT_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif",
+                 "webp": "image/webp", "heic": "image/heic", "heif": "image/heif", "pdf": "application/pdf"}
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8090"))
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
 SESSION_DAYS = int(os.environ.get("SESSION_DAYS", "30"))
 COOKIE_NAME = "tf_session"
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -163,6 +169,26 @@ CREATE TABLE IF NOT EXISTS board_columns (
   sort REAL DEFAULT 0,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS expenses (
+  id INTEGER PRIMARY KEY,
+  team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+  date TEXT NOT NULL,
+  title TEXT NOT NULL,
+  amount_cents INTEGER NOT NULL DEFAULT 0,
+  category TEXT,
+  vendor TEXT,
+  paid_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  project TEXT,
+  rock_id INTEGER REFERENCES rocks(id) ON DELETE SET NULL,
+  reimburse TEXT NOT NULL DEFAULT 'none',
+  notes TEXT,
+  receipt_file TEXT,
+  receipt_name TEXT,
+  receipt_type TEXT,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_expenses_team ON expenses(team_id, date);
 CREATE TABLE IF NOT EXISTS vto (
   team_id INTEGER PRIMARY KEY REFERENCES teams(id) ON DELETE CASCADE,
   data TEXT NOT NULL,
@@ -200,6 +226,9 @@ RESOURCES = {
                         "ext_key": str, "priority": str, "project": str, "phase": str, "workstream": str},
                   team=True, order="done, due_date IS NULL, due_date, id"),
     "boards": dict(cols={"team_id": int, "name": str, "sort": float}, required="name", team=True, order="sort, id"),
+    "expenses": dict(cols={"team_id": int, "date": str, "title": str, "amount_cents": int, "category": str, "vendor": str,
+                           "paid_by": int, "project": str, "rock_id": int, "reimburse": str, "notes": str},
+                     team=True, order="date DESC, id DESC", choices={"reimburse": ("none", "owed", "paid")}),
     "board_columns": dict(cols={"board_id": int, "name": str, "color": str, "is_done": int, "sort": float},
                           required="name", parent=("board_id",), order="sort, id",
                           choices={"color": ("gray", "brown", "orange", "yellow", "green", "blue", "purple", "pink", "red")}),
@@ -441,6 +470,13 @@ def guess_rock(value, rocks):
     return best
 
 
+def remove_receipt(fname):
+    try:
+        os.remove(os.path.join(RECEIPT_DIR, os.path.basename(fname)))
+    except OSError:
+        pass
+
+
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -554,6 +590,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the browser went away mid-request (closed tab, phone went to sleep); nothing to do
+
     def do_GET(self):
         self.dispatch("GET")
 
@@ -576,6 +618,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/events" and method == "GET":
             self.events_stream()
             return
+        if method == "GET" and (path == "/api/admin/backup" or path.startswith("/api/receipts/")):
+            self.binary_route(path)
+            return
         if path.startswith("/api/"):
             conn = db()
             try:
@@ -591,6 +636,9 @@ class Handler(BaseHTTPRequestHandler):
             except sqlite3.IntegrityError as e:
                 conn.rollback()
                 self.send_json(400, {"error": "Data conflict: " + str(e)})
+            except (BrokenPipeError, ConnectionResetError):
+                conn.rollback()
+                raise
             except Exception:
                 conn.rollback()
                 traceback.print_exc()
@@ -671,6 +719,112 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             HUB.unsubscribe(client_id, q)
+
+    # ---------- binary downloads: receipts and backups ----------
+    def binary_route(self, path):
+        conn = db()
+        try:
+            user = self.current_user(conn)
+            if not user:
+                return self.send_json(401, {"error": "Not signed in"})
+            if path == "/api/admin/backup":
+                if not user["is_admin"]:
+                    return self.send_json(403, {"error": "Only admins can download backups"})
+                conn.close()
+                conn = None
+                return self.send_backup(user)
+            rid = path.rsplit("/", 1)[-1]
+            r = conn.execute("SELECT receipt_file, receipt_name, receipt_type FROM expenses WHERE id=?",
+                             (int(rid) if rid.isdigit() else -1,)).fetchone()
+            if not r or not r["receipt_file"]:
+                return self.send_json(404, {"error": "No receipt"})
+            full = os.path.join(RECEIPT_DIR, os.path.basename(r["receipt_file"]))
+            if not os.path.isfile(full):
+                return self.send_json(404, {"error": "Receipt file is missing"})
+            self.send_file(full, r["receipt_type"] or "application/octet-stream", r["receipt_name"] or "receipt", inline=True)
+        finally:
+            if conn:
+                conn.close()
+
+    def send_file(self, full, ctype, filename, inline):
+        size = os.path.getsize(full)
+        safe_name = re.sub(r'[^A-Za-z0-9._ -]', "_", filename)[:120] or "file"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition", f'{"inline" if inline else "attachment"}; filename="{safe_name}"')
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if ctype.startswith("image/"):
+            self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'")
+        self.end_headers()
+        with open(full, "rb") as f:
+            shutil.copyfileobj(f, self.wfile, 256 * 1024)
+
+    def send_backup(self, user):
+        tmp = tempfile.mkdtemp(prefix="tenfold-backup-")
+        try:
+            snap = os.path.join(tmp, "tenfold.db")
+            src, dst = db(), sqlite3.connect(snap)
+            try:
+                src.backup(dst)  # consistent snapshot, safe while people are using the app
+            finally:
+                dst.close()
+                src.close()
+            stamp = datetime.now().strftime("%Y-%m-%d-%H%M")
+            zpath = os.path.join(tmp, f"tenfold-backup-{stamp}.zip")
+            receipts = 0
+            with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+                z.write(snap, "tenfold.db")
+                if os.path.isdir(RECEIPT_DIR):
+                    for name in sorted(os.listdir(RECEIPT_DIR)):
+                        full = os.path.join(RECEIPT_DIR, name)
+                        if os.path.isfile(full):
+                            z.write(full, "receipts/" + name, compress_type=zipfile.ZIP_STORED)
+                            receipts += 1
+                z.writestr("RESTORE.txt", (
+                    f"Tenfold {VERSION} backup, made {now_iso()} by {user['name']}.\n\n"
+                    "To restore on Unraid:\n"
+                    "1. Stop the tenfold container (Docker tab).\n"
+                    "2. In /mnt/user/appdata/tenfold, delete tenfold.db, tenfold.db-wal, tenfold.db-shm and the receipts folder.\n"
+                    "3. Copy tenfold.db and the receipts folder from this zip into /mnt/user/appdata/tenfold.\n"
+                    "4. Start the container. If Tenfold has been updated since this backup was made, the database upgrades itself automatically.\n"))
+            sys.stderr.write(f"Backup downloaded by {user['name']} ({receipts} receipts)\n")
+            self.send_file(zpath, "application/zip", os.path.basename(zpath), inline=False)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def receipt_api(self, conn, method, expense_id, body):
+        exp = conn.execute("SELECT * FROM expenses WHERE id=?", (expense_id,)).fetchone()
+        if not exp:
+            raise ApiError(404, "Expense not found")
+        old = exp["receipt_file"]
+        if method == "POST":
+            name = os.path.basename(str(body.get("filename") or "receipt"))[:120]
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+            if ext not in RECEIPT_TYPES:
+                raise ApiError(400, "Receipts can be photos (JPG, PNG, HEIC, WebP, GIF) or PDFs")
+            try:
+                data = base64.b64decode(str(body.get("data") or ""), validate=False)
+            except Exception:
+                raise ApiError(400, "Couldn't read that file")
+            if not data:
+                raise ApiError(400, "That file is empty")
+            if len(data) > RECEIPT_MAX:
+                raise ApiError(400, "Receipts can be up to 15 MB")
+            os.makedirs(RECEIPT_DIR, exist_ok=True)
+            fname = f"{expense_id}-{secrets.token_hex(8)}.{ext}"
+            with open(os.path.join(RECEIPT_DIR, fname), "wb") as f:
+                f.write(data)
+            conn.execute("UPDATE expenses SET receipt_file=?, receipt_name=?, receipt_type=? WHERE id=?",
+                         (fname, name, RECEIPT_TYPES[ext], expense_id))
+        elif method == "DELETE":
+            conn.execute("UPDATE expenses SET receipt_file=NULL, receipt_name=NULL, receipt_type=NULL WHERE id=?", (expense_id,))
+        else:
+            raise ApiError(405, "Method not allowed")
+        if old:
+            remove_receipt(old)
+        return self.out("expenses", conn.execute("SELECT * FROM expenses WHERE id=?", (expense_id,)).fetchone())
 
     def send_json(self, status, obj):
         data = json.dumps(obj).encode()
@@ -832,6 +986,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if head == "vto":
             return self.vto_api(conn, method, parts, body)
+
+        if head == "expenses" and len(parts) == 3 and parts[1].isdigit() and parts[2] == "receipt":
+            return self.receipt_api(conn, method, int(parts[1]), body)
 
         if head == "import":
             return self.import_api(conn, method, parts, body)
@@ -1040,6 +1197,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if name == "todos" and method in ("POST", "PUT"):
             self.sync_task_column(conn, values, rid)
+        if name == "expenses":
+            if "date" in values and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", values["date"] or ""):
+                raise ApiError(400, "Pick a date for the expense")
+            if method == "POST":
+                values.setdefault("date", datetime.now().strftime("%Y-%m-%d"))
+                values["created_by"] = self.user["id"]
+            if values.get("amount_cents") is not None and abs(values["amount_cents"]) > 10**11:
+                raise ApiError(400, "That amount is too large")
 
         required = spec.get("required", "title")
         if method == "POST":
@@ -1092,6 +1257,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.out(name, conn.execute(f"SELECT * FROM {name} WHERE id=?", (rid,)).fetchone())
 
         if method == "DELETE":
+            if name == "expenses" and existing["receipt_file"]:
+                remove_receipt(existing["receipt_file"])
             if name == "board_columns":  # keep the tasks: move them to the nearest remaining column
                 other = conn.execute(
                     "SELECT * FROM board_columns WHERE board_id=? AND id<>? ORDER BY ABS(sort - ?), sort LIMIT 1",

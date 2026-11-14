@@ -19,6 +19,7 @@ A small, self-hosted team tool for running your business on EOS®-style practice
 | **Accountability Chart** | A separate org chart per team, showing the seats, the people in each seat, and their roles |
 | **Boards** | Kanban boards per team for agile project work. Every card is also a to-do: dragging it to Done checks it off, and checking it off moves it to Done. Cards link to rocks and to any number of people, and have priority, project, phase, workstream and due date. Filters, search, and drag-and-drop (press and hold on phones) |
 | **Milestones** | Any to-do or card can be a milestone. It shows a ◆ Milestone tag and still checks off like a to-do. Rocks show milestone and task progress |
+| **Expenses** | Per-team spending log with date, amount, category, vendor, who paid, project and rock links, reimbursement status (company paid / owed / paid back) and receipt photos or PDFs. Totals by category, project and person, period filters, and CSV export |
 | **Notion / CSV import** | Upload a Notion database export (zip) or any CSV. You match names to people and values to rocks before importing |
 | **Availability** | Weekly team calendar from everyone's Google Calendar, showing busy blocks per person and highlighting times when everyone is free. Teammates see only busy/free, never event titles |
 | **Live updates** | Changes from friends appear on everyone's screen within about a second, with a note saying who changed what. The sidebar shows who's online, and meetings stay in sync across everyone's screens. Refreshes wait while you're typing |
@@ -183,7 +184,20 @@ To publish a versioned release, tag it: `git tag v1.1.0 && git push --tags`.
 
 ## Backups
 
-Everything is stored in one file, `/mnt/user/appdata/tenfold/tenfold.db` (plus `-wal` and `-shm` files while it's running). The **Appdata Backup** plugin covers it automatically. For a manual backup, stop the container and copy the folder.
+**From the website (admins only):** go to **Settings → Backup → Download backup**. You get a zip on whatever device you're using, containing:
+- `tenfold.db`, a consistent copy of the whole database (safe to take while people are using Tenfold).
+- The `receipts/` folder with all receipt files.
+- `RESTORE.txt`, the restore steps.
+
+The server refuses backup downloads from anyone who isn't an admin.
+
+**To restore:**
+1. Stop the container.
+2. In `/mnt/user/appdata/tenfold`, delete `tenfold.db`, `tenfold.db-wal`, `tenfold.db-shm` and `receipts/`.
+3. Copy `tenfold.db` and `receipts/` from the zip into that folder.
+4. Start the container. A backup from an older version upgrades itself automatically.
+
+**On Unraid:** everything lives in `/mnt/user/appdata/tenfold`, so the **Appdata Backup** plugin also covers it.
 
 ## Configuration
 
@@ -207,7 +221,7 @@ python3 server.py
 ## Troubleshooting
 
 - **"pull access denied" or "unauthorized" when installing:** the GHCR package is still private (see Part 1, step 4), or the username in the repository field isn't all lowercase.
-- **The page won't load:** check the container log (Docker tab → Tenfold icon → *Logs*). It should say `Tenfold 1.6.0 running on http://0.0.0.0:8090`. Make sure the host port isn't used by another container.
+- **The page won't load:** check the container log (Docker tab → Tenfold icon → *Logs*). It should say `Tenfold 1.7.0 running on http://0.0.0.0:8090`. Make sure the host port isn't used by another container.
 - **You keep getting signed out over plain HTTP:** make sure `COOKIE_SECURE` is `false` unless you're using HTTPS.
 - **Forgot the admin password:** another admin can reset it under Settings → People. If you were the only admin, stop the container, delete `tenfold.db`, and start over (this erases everything), or ask for help resetting it with `sqlite3`.
 
